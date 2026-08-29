@@ -1,9 +1,11 @@
 import { describe, expect, test } from "bun:test";
 import {
+	estimateRemainingQuotaTime,
 	extractUsageReports,
 	formatSimpleUsage,
 	formatSimpleUsageStyled,
 	isHiddenSimpleLimit,
+	mergeUnreportedAccounts,
 	type SimpleUsageReport,
 } from "../src/simple-usage.ts";
 
@@ -69,6 +71,30 @@ describe("simple usage filtering", () => {
 		expect(isHiddenSimpleLimit(fixture[1], fixture[1].limits![2])).toBe(true);
 	});
 
+	test("hides short windows and Claude Fable details from the simple view", () => {
+		const report: SimpleUsageReport = {
+			provider: "anthropic",
+			limits: [
+				{ id: "anthropic:5h", label: "Claude 5 Hour", amount: { used: 10, limit: 100, unit: "percent" } },
+				{ id: "anthropic:7d", label: "Claude 7 Day", amount: { used: 20, limit: 100, unit: "percent" } },
+				{ id: "anthropic:7d:fable", label: "Claude 7 Day (Fable)", amount: { used: 30, limit: 100, unit: "percent" } },
+			],
+		};
+		const output = formatSimpleUsage([report], now);
+		expect(output).toContain("Claude 7 Day");
+		expect(output).not.toContain("Claude 5 Hour");
+		expect(output).not.toContain("Fable");
+		expect(output).toContain("Total usage");
+		expect(output).toContain("20% used · 80% left · 1 quota");
+		expect(isHiddenSimpleLimit({ provider: "cursor" }, {
+			id: "cursor:short",
+			window: { durationMs: 5 * 60 * 60 * 1000 },
+		})).toBe(true);
+		const full = formatSimpleUsage([report], now, { title: "Usage", hideFilteredLimits: false });
+		expect(full).toContain("Claude 5 Hour");
+		expect(full).toContain("Fable");
+	});
+
 	test("keeps every provider's primary subscription quota across the supported matrix", () => {
 		const hidden: Array<[string, string, Record<string, unknown>?]> = [
 			// [provider, hidden limit id, extra limit fields]
@@ -77,6 +103,9 @@ describe("simple usage filtering", () => {
 			["zai", "zai:features:zread:7d"],
 			["umans", "umans:concurrency"],
 			["opencode-go", "monthly"],
+			["anthropic", "anthropic:7d:fable"],
+			["anthropic", "anthropic:5h"],
+			["minimax-code", "general:5h"],
 		];
 		for (const [provider, id] of hidden) {
 			const report = { provider };
@@ -89,10 +118,8 @@ describe("simple usage filtering", () => {
 		expect(isHiddenSimpleLimit({ provider: "openai-codex" }, { id: "openai-codex:secondary" })).toBe(false);
 
 		const kept: Array<[string, string]> = [
-			["anthropic", "anthropic:5h"],
 			["anthropic", "anthropic:7d"],
 			["anthropic", "anthropic:7d:opus"],
-			["anthropic", "anthropic:7d:fable"],
 			["anthropic", "anthropic:extra"],
 			["xai-oauth", "xai-oauth:credits:1w"],
 			["xai-oauth", "xai-oauth:included:1mo"],
@@ -101,20 +128,16 @@ describe("simple usage filtering", () => {
 			["github-copilot", "copilot:chat"],
 			["github-copilot", "copilot:completions"],
 			["zai", "zai:tokens:7d"],
-			["zai", "zai:requests:5h"],
+			["zai", "zai:requests:7d"],
 			["umans", "umans:requests"],
 			["umans", "umans:requests:soft"],
 			["umans", "umans:requests:hard"],
-			["opencode-go", "rolling-5h"],
 			["opencode-go", "weekly"],
-			["alibaba-token-plan", "credits:5h"],
 			["alibaba-token-plan", "credits:7d"],
 			["kimi-code", "kimi-code:0"],
-			["minimax-code", "general:5h"],
-			["minimax-code", "m2:5h"],
+			["minimax-code", "general:7d"],
 			["google-gemini-cli", "gemini-3-pro:quota"],
-			["google-antigravity", "google-antigravity:default:default:5h"],
-			["synthetic", "synthetic:requests:5h"],
+			["google-antigravity", "google-antigravity:default:default:7d"],
 			["synthetic", "synthetic:usd:7d"],
 			["cursor", "cursor:usd:individual-auto"],
 			["cursor", "cursor:usd:individual-api"],
@@ -147,7 +170,7 @@ describe("simple usage filtering", () => {
 		const reports: SimpleUsageReport[] = [
 			{ provider: "github-copilot", limits: [{ id: "copilot:premium", label: "Premium Requests" }] },
 			{ provider: "google-gemini-cli", limits: [{ id: "quota", label: "Gemini 3 Pro" }] },
-			{ provider: "minimax-code", limits: [{ id: "general:5h", label: "General 5 Hour" }] },
+			{ provider: "minimax-code", limits: [{ id: "general:7d", label: "General 7 Day" }] },
 			{ provider: "zai", limits: [{ id: "zai:tokens:7d", label: "ZAI 7 Day Token Quota" }] },
 		];
 		const output = formatSimpleUsage(reports);
@@ -164,9 +187,132 @@ describe("simple usage filtering", () => {
 		expect(output).toContain("resets in 5d");
 	});
 
+	test("forecasts remaining quota time from the observed window burn rate", () => {
+		const limit = {
+			id: "openai-codex:primary",
+			label: "7 days",
+			amount: { used: 50, limit: 100, unit: "percent" },
+			window: { durationMs: 7 * 24 * 60 * 60 * 1000, resetsAt: now + 5 * 24 * 60 * 60 * 1000 },
+		};
+		const estimate = estimateRemainingQuotaTime(limit, now);
+		expect(estimate).toEqual({ milliseconds: 2 * 24 * 60 * 60 * 1000 });
+
+		const oneDayInAt25Percent = estimateRemainingQuotaTime({
+			...limit,
+			amount: { used: 25, limit: 100, unit: "percent" },
+			window: { durationMs: 7 * 24 * 60 * 60 * 1000, resetsAt: now + 6 * 24 * 60 * 60 * 1000 },
+		}, now);
+		expect(oneDayInAt25Percent).toEqual({ milliseconds: 3 * 24 * 60 * 60 * 1000 });
+
+		const slowBurn = estimateRemainingQuotaTime(
+			{ ...limit, amount: { used: 10, limit: 100, unit: "percent" } },
+			now,
+		);
+		expect(slowBurn).toEqual({ milliseconds: 18 * 24 * 60 * 60 * 1000 });
+
+		const plain = formatSimpleUsage([{ provider: "openai-codex", limits: [limit] }], now);
+		expect(plain).toContain("REMAINING: ~2d");
+		const styled = formatSimpleUsageStyled(
+			[{ provider: "openai-codex", limits: [limit] }],
+			{ bold: text => text, fg: (_color, text) => text },
+			100,
+			now,
+		);
+		expect(styled).toContain("REMAINING: ~2d");
+	});
+
+	test("adds simple-view totals for percentages and quantities", () => {
+		const plain = formatSimpleUsage(fixture, now);
+		expect(plain).toContain("Total usage\n  69% used · 31% left · 2 quotas");
+
+		const styled = formatSimpleUsageStyled(
+			fixture,
+			{ bold: text => text, fg: (_color, text) => text },
+			100,
+			now,
+		);
+		expect(styled).toContain("Total usage");
+		expect(styled).toContain("69% used · 31% left · 2 quotas");
+
+		const money = formatSimpleUsage(
+			[{ provider: "cursor", limits: [{ id: "cursor:usd:meter", label: "Usage", amount: { used: 2, limit: 10, unit: "usd" } }] }],
+			now,
+		);
+		expect(money).toContain("$2 / $10 · 20% used · $8 left · 1 quota");
+
+		const full = formatSimpleUsage(fixture, now, { title: "Usage", hideFilteredLimits: false });
+		expect(full).not.toContain("Total usage");
+	});
+
 	test("handles the wrapped JSON shape", () => {
 		expect(extractUsageReports({ reports: fixture })).toEqual(fixture);
 		expect(extractUsageReports({ accountsWithoutUsage: [] })).toEqual([]);
+	});
+
+	test("folds accountsWithoutUsage into empty reports instead of dropping them", () => {
+		const payload = {
+			reports: fixture,
+			accountsWithoutUsage: [
+				{
+					provider: "anthropic",
+					type: "oauth",
+					email: "claude@example.test",
+					orgName: "Claude org",
+				},
+				{
+					provider: "xai-oauth",
+					type: "oauth",
+					email: "grok@example.test",
+				},
+			],
+		};
+		const reports = extractUsageReports(payload);
+		expect(reports).toHaveLength(4);
+		expect(reports.map(report => report.provider)).toEqual([
+			"openai-codex",
+			"xai-oauth",
+			"anthropic",
+			"xai-oauth",
+		]);
+
+		const plain = formatSimpleUsage(reports, now);
+		expect(plain).toContain("Claude — claude@example.test · Claude org");
+		expect(plain).toContain("Grok — grok@example.test");
+		expect(plain).toContain("no usage data");
+
+		const styled = formatSimpleUsageStyled(
+			reports,
+			{
+				bold: text => `<bold>${text}</bold>`,
+				fg: (color, text) => `<${color}>${text}</${color}>`,
+			},
+			100,
+			now,
+		);
+		expect(styled).toContain("Claude");
+		expect(styled).toContain("Grok");
+		expect(styled).toContain("claude@example.test · Claude org — no usage data");
+		expect(styled).toContain("grok@example.test — no usage data");
+	});
+
+	test("does not duplicate an unreported account already covered by a report", () => {
+		const merged = mergeUnreportedAccounts(fixture, [
+			{ provider: "xai-oauth", email: "already-covered@example.test" },
+		]);
+		// xAI fixture has no email/accountId, so identity-less coverage does not apply;
+		// an identified sibling account still gets its own empty row.
+		expect(merged).toHaveLength(3);
+
+		const sameIdentity: SimpleUsageReport[] = [
+			{
+				provider: "anthropic",
+				metadata: { email: "claude@example.test" },
+				limits: [{ id: "anthropic:5h", label: "Claude 5 Hour" }],
+			},
+		];
+		expect(mergeUnreportedAccounts(sameIdentity, [
+			{ provider: "anthropic", email: "claude@example.test" },
+		])).toHaveLength(1);
 	});
 
 	test("renders the filtered report with native usage bars and status colors", () => {

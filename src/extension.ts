@@ -6,6 +6,13 @@ import {
 	formatSimpleUsageStyled,
 	type SimpleUsageReport,
 } from "./simple-usage.ts";
+import {
+	collectPiAuthUsageReports,
+	isPiAuthUsageProvider,
+	mergePiAuthUsageReports,
+	PI_AUTH_USAGE_PROVIDER_IDS,
+	redactPiAuthUsageReports,
+} from "./pi-auth-usage.ts";
 import { getUsageArgumentCompletions } from "./autocomplete.ts";
 
 const MESSAGE_TYPE = "pi-usage";
@@ -87,9 +94,20 @@ function removeSimpleArgs(args: readonly string[]): string[] {
 
 /** Output shapes the styled renderer cannot represent; keep the raw passthrough. */
 function isPassthroughArgs(args: readonly string[]): boolean {
-	return args.some(
-		arg => arg === "invalidate" || arg === "--json" || arg === "--history" || arg.startsWith("--history="),
-	);
+	return args.some(arg => arg === "invalidate" || arg === "--history" || arg.startsWith("--history="));
+}
+
+function requestedProvider(args: readonly string[]): string | undefined {
+	for (let index = 0; index < args.length; index++) {
+		const arg = args[index];
+		if (arg.startsWith("--provider=")) return arg.slice("--provider=".length).trim().toLowerCase() || undefined;
+		if (arg === "--provider") return args[index + 1]?.trim().toLowerCase() || undefined;
+	}
+	return undefined;
+}
+
+function hasArgument(args: readonly string[], value: string): boolean {
+	return args.some(arg => arg.toLowerCase() === value);
 }
 
 function commandFailure(args: readonly string[], result: { code: number; stderr: string; killed: boolean }): Error {
@@ -126,6 +144,9 @@ export default function usageExtension(pi: ExtensionAPI): void {
 			const simple = isSimpleArgs(args);
 			const forwardedArgs = simple ? removeSimpleArgs(args) : args;
 			const passthrough = !simple && isPassthroughArgs(forwardedArgs);
+			const wantsJson = !simple && hasArgument(forwardedArgs, "--json");
+			const provider = requestedProvider(forwardedArgs);
+			const piProvider = provider?.toLowerCase() === "xai" ? "xai-oauth" : provider;
 
 			try {
 				if (simple && forwardedArgs.some(arg => arg === "--history" || arg.startsWith("--history="))) {
@@ -136,11 +157,58 @@ export default function usageExtension(pi: ExtensionAPI): void {
 				const commandArgs = !passthrough
 					? ["usage", "--json", ...forwardedArgs.filter(arg => arg !== "--json")]
 					: ["usage", ...forwardedArgs];
-				const result = await pi.exec(executable, commandArgs, { timeout: USAGE_TIMEOUT_MS });
-				if (result.code !== 0) throw commandFailure(commandArgs.slice(1), result);
+				const piReportsPromise = passthrough
+					? Promise.resolve<SimpleUsageReport[]>([])
+					: collectPiAuthUsageReports(ctx, fetch, piProvider);
+				const skipOmp = !passthrough && isPiAuthUsageProvider(provider);
+				let result: { stdout: string; stderr: string; code: number; killed: boolean };
+				try {
+					result = skipOmp
+						? { stdout: "", stderr: "", code: 0, killed: false }
+						: await pi.exec(executable, commandArgs, { timeout: USAGE_TIMEOUT_MS });
+				} catch (error) {
+					const piReports = await piReportsPromise;
+					if (piReports.length === 0) throw error;
+					result = { stdout: "", stderr: "", code: 1, killed: false };
+				}
+				const piReports = await piReportsPromise;
+				if (result.code !== 0 && piReports.length === 0) throw commandFailure(commandArgs.slice(1), result);
 
 				if (!passthrough) {
-					const reports = extractUsageReports(JSON.parse(result.stdout));
+					let payload: Record<string, unknown> = { reports: [] };
+					if (result.code === 0 && result.stdout.trim()) {
+						try {
+							payload = JSON.parse(result.stdout) as Record<string, unknown>;
+						} catch (error) {
+							if (piReports.length === 0) throw error;
+						}
+					}
+					const piReportsForView = hasArgument(forwardedArgs, "--redact")
+						? redactPiAuthUsageReports(piReports)
+						: piReports;
+					const reports = mergePiAuthUsageReports(extractUsageReports(payload), piReportsForView);
+					if (wantsJson) {
+						const overridden = new Set<string>([
+							...PI_AUTH_USAGE_PROVIDER_IDS,
+							...piReportsForView.map(report => report.provider.toLowerCase()),
+						]);
+						const accountsWithoutUsage = Array.isArray(payload.accountsWithoutUsage)
+							? payload.accountsWithoutUsage.filter(account => {
+								const provider = account && typeof account === "object" ? (account as { provider?: unknown }).provider : undefined;
+								return typeof provider !== "string" || !overridden.has(provider.toLowerCase());
+							})
+							: payload.accountsWithoutUsage;
+						pi.sendMessage(
+							{
+								customType: MESSAGE_TYPE,
+								content: JSON.stringify({ ...payload, reports, accountsWithoutUsage }, null, 2),
+								details: { view: "native" },
+								display: true,
+							},
+							{ triggerTurn: false },
+						);
+						return;
+					}
 					const view = simple ? "simple" : "native";
 					pi.sendMessage(
 						{

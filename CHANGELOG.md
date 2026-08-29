@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.2.0] - 2026-08-29
+
+- Claude and Grok live usage now resolve OAuth credentials from Pi instead of requiring a matching OMP login. OMP remains a fallback for providers without a direct Pi usage collector.
+- Live quota rows now show `REMAINING: ~…`, forecasting quota exhaustion from elapsed window time and observed usage; the reset countdown remains a separate value.
+- `/usage` and `/usage simple` now keep logged-in accounts whose usage API returned nothing (`accountsWithoutUsage` in `omp usage --json`) instead of dropping the provider. Claude and Grok show as `no usage data` rather than disappearing.
+- The simple view now hides short quota windows (including 5-hour limits) and Claude's Fable bucket, then adds a bottom `Total usage` summary for visible percentages and compatible quantities.
+- `--json` now emits a merged report so Pi-auth usage can appear alongside OMP reports.
+
 ## [0.1.0] - 2026-08-24
 
 Initial release.

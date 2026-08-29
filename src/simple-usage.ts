@@ -13,11 +13,15 @@ export interface SimpleUsageScope {
 	windowId?: string;
 	accountId?: string;
 	projectId?: string;
+	orgId?: string;
+	shared?: boolean;
 }
 
 export interface SimpleUsageWindow {
 	id?: string;
 	label?: string;
+	/** Full quota-window length when supplied by the provider. */
+	durationMs?: number;
 	resetsAt?: number;
 	resetLabel?: string;
 }
@@ -38,6 +42,17 @@ export interface SimpleUsageReport {
 	limits?: SimpleUsageLimit[];
 	notes?: string[];
 	metadata?: Record<string, unknown> | null;
+}
+
+/** Logged-in account whose usage API returned no report (`omp usage --json`). */
+export interface SimpleUsageAccountIdentity {
+	provider: string;
+	type?: string;
+	email?: string;
+	accountId?: string;
+	projectId?: string;
+	orgId?: string;
+	orgName?: string;
 }
 
 export type SimpleUsageThemeColor = "accent" | "dim" | "success" | "warning" | "error";
@@ -83,6 +98,9 @@ export const USAGE_PROVIDER_IDS: readonly string[] = Object.keys(PROVIDER_LABELS
 const finite = (value: unknown): value is number =>
 	typeof value === "number" && Number.isFinite(value);
 
+const SHORT_WINDOW_MAX_MS = 24 * 60 * 60_000;
+const SHORT_WINDOW_PATTERN = /\b(?:\d+(?:\.\d+)?\s*(?:h|hr|hrs|hour|hours)|hour(?:s|ly)?)\b/i;
+
 const textValue = (value: unknown): string | undefined => {
 	if (typeof value === "string" && value.trim()) return value.trim();
 	if (typeof value === "number" && Number.isFinite(value)) return String(value);
@@ -97,12 +115,26 @@ function isXaiProvider(provider: string): boolean {
  * True when a limit is noise for the simple view. Kept rows answer "how much
  * of my subscription is left": account-level quota windows and paid overage.
  * Hidden rows are per-model/per-product breakdowns that duplicate the account
- * aggregate, feature side-quotas, instantaneous gauges, and display-only
- * windows that never block.
+ * aggregate, feature side-quotas, short windows, instantaneous gauges, and
+ * display-only windows that never block.
  */
 export function isHiddenSimpleLimit(report: SimpleUsageReport, limit: SimpleUsageLimit): boolean {
 	const provider = report.provider.toLowerCase();
 	const id = (limit.id ?? "").toLowerCase();
+
+	// Windows of 24 hours or less are noise in a subscription snapshot; the
+	// longer quota windows answer how much of the plan is left.
+	const windowDuration = limit.window?.durationMs;
+	const windowDescription = [limit.window?.id, limit.window?.label, limit.scope?.windowId, limit.label, limit.id]
+		.filter((value): value is string => typeof value === "string")
+		.join(" ");
+	if ((finite(windowDuration) && windowDuration > 0 && windowDuration <= SHORT_WINDOW_MAX_MS) || SHORT_WINDOW_PATTERN.test(windowDescription)) {
+		return true;
+	}
+
+	// Claude's Fable model bucket is a per-model detail, not the account-level
+	// weekly quota shown in the simple view.
+	if (provider === "anthropic" && /\bfable\b/i.test(`${id} ${limit.label ?? ""} ${limit.scope?.tier ?? ""}`)) return true;
 
 	// Codex metered-feature buckets (Spark and any future meters): the shared
 	// primary/secondary windows carry the subscription quota; tiered buckets
@@ -143,6 +175,7 @@ function isCursorAggregateLimit(limit: SimpleUsageLimit): boolean {
  * Limits visible in the simple view. Context-aware: a Cursor aggregate row
  * ("Personal Usage") is dropped only when the report also carries the
  * itemized meters it duplicates, so a plan with nothing else still renders.
+ * Short windows and Claude's Fable model bucket are omitted as details.
  */
 export function filterSimpleLimits(report: SimpleUsageReport): SimpleUsageLimit[] {
 	const limits = (report.limits ?? []).filter(limit => !isHiddenSimpleLimit(report, limit));
@@ -165,12 +198,17 @@ function accountLabel(report: SimpleUsageReport): string | undefined {
 	if (!metadata) return undefined;
 
 	const parts = [
+		metadata.email,
 		metadata.orgName,
 		metadata.organization,
-		metadata.email,
+		metadata.accountId,
 	].map(textValue).filter((value): value is string => Boolean(value));
 
 	return [...new Set(parts)].join(" · ") || undefined;
+}
+
+function isEmptyUsageReport(report: SimpleUsageReport): boolean {
+	return (report.limits ?? []).length === 0;
 }
 
 function usedFraction(limit: SimpleUsageLimit): number | undefined {
@@ -271,6 +309,71 @@ function resetSuffix(limit: SimpleUsageLimit, now: number): string {
 	return ` · resets in ${duration(resetAt - now)}`;
 }
 
+export interface SimpleRemainingEstimate {
+	/** Projected time until the quota is exhausted at the current burn rate. */
+	milliseconds: number;
+}
+
+function inferredWindowDuration(limit: SimpleUsageLimit, resetAt?: number): number | undefined {
+	const declared = limit.window?.durationMs;
+	if (finite(declared) && declared > 0) return declared;
+
+	const description = [limit.window?.label, limit.scope?.windowId, limit.label, limit.id]
+		.filter((value): value is string => typeof value === "string")
+		.join(" ")
+		.toLowerCase();
+	if (/month|monthly/.test(description)) {
+		if (resetAt !== undefined) {
+			const start = new Date(resetAt);
+			start.setUTCMonth(start.getUTCMonth() - 1);
+			const durationMs = resetAt - start.getTime();
+			if (finite(durationMs) && durationMs > 0) return durationMs;
+		}
+		return 30 * 24 * 60 * 60_000;
+	}
+	if (/week|weekly/.test(description)) return 7 * 24 * 60 * 60_000;
+	const match = /\b(\d+(?:\.\d+)?)\s*(hours?|hrs?|h|days?|d|minutes?|mins?|m)\b/i.exec(description);
+	if (!match) return undefined;
+	const value = Number(match[1]);
+	if (!Number.isFinite(value) || value <= 0) return undefined;
+	const unit = match[2].toLowerCase();
+	if (unit.startsWith("d")) return value * 24 * 60 * 60_000;
+	if (unit.startsWith("h")) return value * 60 * 60_000;
+	return value * 60_000;
+}
+
+/**
+ * Forecast the time until quota exhaustion at the observed average consumption
+ * rate for this window. The reset countdown remains separate in the display;
+ * this value intentionally reports the pure burn-rate projection even when it
+ * falls after the provider reset.
+ */
+export function estimateRemainingQuotaTime(limit: SimpleUsageLimit, now = Date.now()): SimpleRemainingEstimate | undefined {
+	const resetAt = limit.window?.resetsAt ?? limit.resetsAt;
+	const used = usedFraction(limit);
+	if (!finite(resetAt) || resetAt <= now || used === undefined) return undefined;
+	const durationMs = inferredWindowDuration(limit, resetAt);
+	if (durationMs === undefined || durationMs <= 0) return undefined;
+
+	const remainingUntilReset = Math.max(resetAt - now, 0);
+	const elapsed = Math.max(0, durationMs - Math.min(remainingUntilReset, durationMs));
+	const clampedUsed = Math.min(Math.max(used, 0), 1);
+	if (clampedUsed === 0 || elapsed === 0) return undefined;
+
+	const projectedUntilExhausted = elapsed * ((1 - clampedUsed) / clampedUsed);
+	if (!Number.isFinite(projectedUntilExhausted)) return undefined;
+	return { milliseconds: Math.max(0, projectedUntilExhausted) };
+}
+
+function estimateDuration(milliseconds: number): string {
+	return milliseconds <= 0 ? "0m" : duration(milliseconds);
+}
+
+function remainingEstimateSuffix(limit: SimpleUsageLimit, now: number): string {
+	const estimate = estimateRemainingQuotaTime(limit, now);
+	return estimate ? ` · REMAINING: ~${estimateDuration(estimate.milliseconds)}` : "";
+}
+
 function cleanLabel(value: unknown): string {
 	return String(value ?? "quota").replace(/[\r\n]+/g, " ").trim() || "quota";
 }
@@ -285,7 +388,7 @@ export function formatSimpleUsage(
 	const prepared = reports
 		.flatMap((report, reportIndex) => {
 			const visibleLimits = hideFilteredLimits ? filterSimpleLimits(report) : [...(report.limits ?? [])];
-			if (visibleLimits.length === 0) return [];
+			if (visibleLimits.length === 0 && !isEmptyUsageReport(report)) return [];
 			return [{ report, reportIndex, visibleLimits, account: accountLabel(report) }];
 		})
 		.sort((left, right) => {
@@ -311,9 +414,18 @@ export function formatSimpleUsage(
 		const fallbackAccount = providerCounts.get(providerKey)! > 1 ? `account ${providerPosition}` : undefined;
 		const heading = [provider, item.account ?? fallbackAccount].filter(Boolean).join(" — ");
 		lines.push("", heading);
-		for (const limit of item.visibleLimits) {
-			lines.push(`  ${statusMarker(limit)} ${cleanLabel(limit.label ?? limit.window?.label ?? limit.id)}: ${usageDetail(limit)}${resetSuffix(limit, now)}`);
+		if (item.visibleLimits.length === 0) {
+			lines.push("  · no usage data");
+			continue;
 		}
+		for (const limit of item.visibleLimits) {
+			lines.push(`  ${statusMarker(limit)} ${cleanLabel(limit.label ?? limit.window?.label ?? limit.id)}: ${usageDetail(limit)}${resetSuffix(limit, now)}${remainingEstimateSuffix(limit, now)}`);
+		}
+	}
+
+	if (hideFilteredLimits) {
+		const totalLines = simpleTotalUsageLines(prepared.flatMap(item => item.visibleLimits));
+		if (totalLines.length > 0) lines.push("", "Total usage", ...totalLines.map(line => `  ${line}`));
 	}
 
 	return lines.join("\n");
@@ -448,15 +560,19 @@ function simpleAccountHeaderRow(
 ): string[] {
 	const parts = limits.map((limit, index) => ({
 		label: simpleAccountLabel(limit, reports[index] ?? { provider: "unknown" }, index),
-		suffix: simpleResetShort(limit, now),
+		reset: simpleResetShort(limit, now),
+		remaining: remainingEstimateSuffix(limit, now).replace(/^ · /, ""),
 	}));
-	const maxSuffixWidth = parts.reduce((max, part) => Math.max(max, simpleVisibleWidth(part.suffix ? `(${part.suffix})` : "")), 0);
+	const suffixText = (part: (typeof parts)[number]): string =>
+		[part.reset ? `(${part.reset})` : "", part.remaining].filter(Boolean).join(" ");
+	const maxSuffixWidth = parts.reduce((max, part) => Math.max(max, simpleVisibleWidth(suffixText(part))), 0);
 	const gap = maxSuffixWidth > 0 ? 1 : 0;
 	const prefixBudget = columnWidth - maxSuffixWidth - gap;
 
 	if (prefixBudget < 2) {
 		return parts.map(part => {
-			const full = part.suffix ? `${part.label} (${part.suffix})` : part.label;
+			const suffix = suffixText(part);
+			const full = suffix ? `${part.label} ${suffix}` : part.label;
 			return simplePad(simpleTruncate(full, columnWidth), columnWidth);
 		});
 	}
@@ -464,8 +580,8 @@ function simpleAccountHeaderRow(
 	return parts.map(part => {
 		const prefix = simpleTruncate(part.label, prefixBudget);
 		const prefixCell = simplePad(prefix, prefixBudget);
-		if (!part.suffix) return `${prefixCell}${" ".repeat(maxSuffixWidth + gap)}`;
-		const suffix = `(${part.suffix})`;
+		const suffix = suffixText(part);
+		if (!suffix) return `${prefixCell}${" ".repeat(maxSuffixWidth + gap)}`;
 		return `${prefixCell} ${" ".repeat(maxSuffixWidth - simpleVisibleWidth(suffix))}${uiTheme.fg("dim", suffix)}`;
 	});
 }
@@ -511,6 +627,86 @@ function simpleAggregateAmount(limits: readonly SimpleUsageLimit[]): string {
 	);
 	const count = uniqueAccountIds.size || limits.length;
 	return `${count} ${count === 1 ? "acct" : "accts"}`;
+}
+
+const TOTAL_QUANTITY_UNITS = new Set(["usd", "tokens", "requests", "minutes", "bytes"]);
+
+function quotaCount(count: number): string {
+	return `${count} ${count === 1 ? "quota" : "quotas"}`;
+}
+
+/** Aggregate visible simple-view limits without mixing incompatible units. */
+function simpleTotalUsageLines(limits: readonly SimpleUsageLimit[]): string[] {
+	const lines: string[] = [];
+	const percentageLimits = limits.filter(limit => {
+		const fraction = usedFraction(limit);
+		if (fraction === undefined) return false;
+		const amount = limit.amount;
+		const unit = typeof amount?.unit === "string" ? amount.unit.toLowerCase() : undefined;
+		const hasQuantity = Boolean(
+			amount &&
+			finite(amount.used) &&
+			finite(amount.limit) &&
+			amount.limit > 0 &&
+			unit &&
+			TOTAL_QUANTITY_UNITS.has(unit),
+		);
+		return !hasQuantity;
+	});
+	if (percentageLimits.length > 0) {
+		const used = percentageLimits
+			.map(limit => Math.min(Math.max(usedFraction(limit) ?? 0, 0), 1))
+			.reduce((sum, fraction) => sum + fraction, 0) / percentageLimits.length;
+		lines.push(`${percent(used)} used · ${percent(Math.max(0, 1 - used))} left · ${quotaCount(percentageLimits.length)}`);
+	}
+
+	const amounts = new Map<string, { used: number; limit: number; count: number }>();
+	for (const limit of limits) {
+		const amount = limit.amount;
+		const unit = typeof amount?.unit === "string" ? amount.unit.toLowerCase() : undefined;
+		if (
+			!amount ||
+			!unit ||
+			!TOTAL_QUANTITY_UNITS.has(unit) ||
+			!finite(amount.used) ||
+			!finite(amount.limit) ||
+			amount.limit <= 0
+		) continue;
+		const total = amounts.get(unit) ?? { used: 0, limit: 0, count: 0 };
+		total.used += amount.used;
+		total.limit += amount.limit;
+		total.count++;
+		amounts.set(unit, total);
+	}
+	for (const [unit, total] of amounts) {
+		const used = Math.min(Math.max(total.used / total.limit, 0), 1);
+		lines.push(
+			`${quantity(total.used, unit)} / ${quantity(total.limit, unit)} · ${percent(used)} used · ${quantity(Math.max(0, total.limit - total.used), unit)} left · ${quotaCount(total.count)}`,
+		);
+	}
+
+	const usedOnly = new Map<string, { used: number; count: number }>();
+	for (const limit of limits) {
+		const amount = limit.amount;
+		const unit = typeof amount?.unit === "string" ? amount.unit.toLowerCase() : undefined;
+		if (
+			!amount ||
+			!unit ||
+			!TOTAL_QUANTITY_UNITS.has(unit) ||
+			!finite(amount.used) ||
+			finite(amount.limit) ||
+			finite(amount.remaining)
+		) continue;
+		const total = usedOnly.get(unit) ?? { used: 0, count: 0 };
+		total.used += amount.used;
+		total.count++;
+		usedOnly.set(unit, total);
+	}
+	for (const [unit, total] of usedOnly) {
+		lines.push(`${quantity(total.used, unit)} used · ${quotaCount(total.count)}`);
+	}
+
+	return lines;
 }
 
 function simpleResetRange(limits: readonly SimpleUsageLimit[], now: number): string | null {
@@ -569,12 +765,13 @@ export function formatSimpleUsageStyled(
 			report,
 			visibleLimits: hideFilteredLimits ? filterSimpleLimits(report) : [...(report.limits ?? [])],
 		}))
-		.filter(item => item.visibleLimits.length > 0);
+		.filter(item => item.visibleLimits.length > 0 || isEmptyUsageReport(item.report));
 	if (visibleByReport.length === 0) {
 		lines.push("", uiTheme.fg("dim", "No visible usage data."));
 		return lines.join("\n");
 	}
 
+	const totalLimits = visibleByReport.flatMap(item => item.visibleLimits);
 	const providers = new Map<string, Array<{ report: SimpleUsageReport; visibleLimits: SimpleUsageLimit[] }>>();
 	for (const item of visibleByReport) {
 		const providerReports = providers.get(item.report.provider) ?? [];
@@ -645,9 +842,65 @@ export function formatSimpleUsageStyled(
 			const resetText = limits.length <= 1 ? simpleResetRange(limits, now) : null;
 			if (resetText) lines.push(`  ${uiTheme.fg("dim", resetText)}`.trimEnd());
 		}
+
+		for (const { report, visibleLimits } of providerReports) {
+			if (visibleLimits.length > 0) continue;
+			const label = accountLabel(report) ?? "account";
+			lines.push(`${uiTheme.fg("dim", "·")} ${uiTheme.fg("dim", `${label} — no usage data`)}`);
+		}
+	}
+
+	if (hideFilteredLimits) {
+		const totalLines = simpleTotalUsageLines(totalLimits);
+		if (totalLines.length > 0) {
+			lines.push("", uiTheme.bold(uiTheme.fg("accent", "Total usage")));
+			lines.push(...totalLines.map(line => `  ${uiTheme.fg("dim", line)}`));
+		}
 	}
 
 	return lines.join("\n");
+}
+
+function unreportedAccountToReport(account: SimpleUsageAccountIdentity): SimpleUsageReport {
+	return {
+		provider: account.provider,
+		limits: [],
+		metadata: {
+			...(account.email ? { email: account.email } : {}),
+			...(account.accountId ? { accountId: account.accountId } : {}),
+			...(account.projectId ? { projectId: account.projectId } : {}),
+			...(account.orgId ? { orgId: account.orgId } : {}),
+			...(account.orgName ? { orgName: account.orgName } : {}),
+		},
+	};
+}
+
+function identityKeys(value: { email?: unknown; accountId?: unknown; projectId?: unknown } | null | undefined): string[] {
+	return [value?.email, value?.accountId, value?.projectId]
+		.map(textValue)
+		.filter((part): part is string => Boolean(part))
+		.map(part => part.toLowerCase());
+}
+
+/** Fold omp's `accountsWithoutUsage` rows into empty reports so they still render. */
+export function mergeUnreportedAccounts(
+	reports: readonly SimpleUsageReport[],
+	accounts: readonly SimpleUsageAccountIdentity[],
+): SimpleUsageReport[] {
+	if (accounts.length === 0) return [...reports];
+	const extra: SimpleUsageReport[] = [];
+	for (const account of accounts) {
+		if (!account.provider) continue;
+		const provider = account.provider.toLowerCase();
+		const ids = identityKeys(account);
+		const alreadyCovered = reports.some(report => {
+			if (report.provider.toLowerCase() !== provider) return false;
+			if (ids.length === 0) return true;
+			return identityKeys(report.metadata).some(id => ids.includes(id));
+		});
+		if (!alreadyCovered) extra.push(unreportedAccountToReport(account));
+	}
+	return extra.length === 0 ? [...reports] : [...reports, ...extra];
 }
 
 /** Accept both a bare report array and the JSON command's wrapper object. */
@@ -656,8 +909,15 @@ export function extractUsageReports(payload: unknown): SimpleUsageReport[] {
 	if (!payload || typeof payload !== "object") return [];
 
 	const record = payload as Record<string, unknown>;
+	let reports: SimpleUsageReport[] = [];
 	for (const key of ["reports", "usageReports", "data"]) {
-		if (Array.isArray(record[key])) return record[key] as SimpleUsageReport[];
+		if (Array.isArray(record[key])) {
+			reports = record[key] as SimpleUsageReport[];
+			break;
+		}
 	}
-	return [];
+	const unreported = Array.isArray(record.accountsWithoutUsage)
+		? (record.accountsWithoutUsage as SimpleUsageAccountIdentity[])
+		: [];
+	return mergeUnreportedAccounts(reports, unreported);
 }

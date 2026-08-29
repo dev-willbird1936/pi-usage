@@ -1,6 +1,6 @@
 {
   "name": "pi-usage-limits",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Pi extension that renders provider usage limits as themed compact or full views.",
   "author": "dev-willbird1936",
   "license": "MIT",
