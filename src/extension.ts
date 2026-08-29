@@ -1,25 +1,24 @@
 import { DynamicBorder, type ExtensionAPI, type ExtensionCommandContext } from "@earendil-works/pi-coding-agent";
 import { Box, Spacer, Text } from "@earendil-works/pi-tui";
 import {
-	extractUsageReports,
 	formatSimpleUsage,
 	formatSimpleUsageStyled,
 	type SimpleUsageReport,
 } from "./simple-usage.ts";
 import {
 	collectPiAuthUsageReports,
-	isPiAuthUsageProvider,
-	mergePiAuthUsageReports,
 	PI_AUTH_USAGE_PROVIDER_IDS,
+	isPiAuthUsageProvider,
 	redactPiAuthUsageReports,
 } from "./pi-auth-usage.ts";
 import { getUsageArgumentCompletions } from "./autocomplete.ts";
 
 const MESSAGE_TYPE = "pi-usage";
-const USAGE_TIMEOUT_MS = 120_000;
+
+type UsageView = "simple" | "expanded" | "current";
 
 type UsageDetails = {
-	view: "native" | "simple";
+	view: UsageView;
 	reports?: SimpleUsageReport[];
 	error?: boolean;
 };
@@ -39,11 +38,6 @@ function textFromContent(content: unknown): string {
 
 function errorMessage(error: unknown): string {
 	return error instanceof Error && error.message ? error.message : String(error);
-}
-
-/** Strip ANSI escape codes from CLI output so Pi's theme owns all coloring. */
-function stripAnsi(text: string): string {
-	return text.replace(/\x1B\[[0-?]*[ -\/]*[@-~]/g, "");
 }
 
 function splitArgs(input: string): string[] {
@@ -84,17 +78,26 @@ function splitArgs(input: string): string[] {
 	return args;
 }
 
-function isSimpleArgs(args: readonly string[]): boolean {
+function requestedView(args: readonly string[]): UsageView {
+	const first = args[0]?.toLowerCase();
+	return first === "current" ? "current" : first === "expanded" ? "expanded" : "simple";
+}
+
+function removeViewArg(args: readonly string[]): string[] {
+	return args.filter((arg, index) => index !== 0 || !["current", "expanded"].includes(arg.toLowerCase()));
+}
+
+function hasRemovedSimpleArg(args: readonly string[]): boolean {
 	return args.some(arg => arg.toLowerCase() === "--simple") || args[0]?.toLowerCase() === "simple";
 }
 
-function removeSimpleArgs(args: readonly string[]): string[] {
-	return args.filter((arg, index) => arg.toLowerCase() !== "--simple" && !(index === 0 && arg.toLowerCase() === "simple"));
+function normalizeProvider(provider: string | undefined): string | undefined {
+	const normalized = provider?.toLowerCase();
+	return normalized === "xai" ? "xai-oauth" : normalized;
 }
 
-/** Output shapes the styled renderer cannot represent; keep the raw passthrough. */
-function isPassthroughArgs(args: readonly string[]): boolean {
-	return args.some(arg => arg === "invalidate" || arg === "--history" || arg.startsWith("--history="));
+function usageTitle(view: UsageView): string {
+	return view === "simple" ? "Usage" : view === "current" ? "Usage (current)" : "Usage (expanded)";
 }
 
 function requestedProvider(args: readonly string[]): string | undefined {
@@ -110,20 +113,12 @@ function hasArgument(args: readonly string[], value: string): boolean {
 	return args.some(arg => arg.toLowerCase() === value);
 }
 
-function commandFailure(args: readonly string[], result: { code: number; stderr: string; killed: boolean }): Error {
-	if (result.killed) return new Error("usage collection timed out after 120 seconds");
-	const details = result.stderr.trim().replace(/\s+/g, " ");
-	return new Error(
-		`omp usage ${args.join(" ") || "failed"} (exit ${result.code})${details ? `: ${details.slice(0, 1000)}` : ""}`,
-	);
-}
-
 export default function usageExtension(pi: ExtensionAPI): void {
 	pi.registerMessageRenderer<UsageDetails>(MESSAGE_TYPE, (message, _options, theme) => {
 		const details = message.details;
 		const body = details?.reports
 			? formatSimpleUsageStyled(details.reports, theme, undefined, undefined, {
-					title: details.view === "simple" ? "Usage (simple)" : "Usage",
+					title: usageTitle(details.view),
 					hideFilteredLimits: details.view === "simple",
 				})
 			: textFromContent(message.content);
@@ -137,111 +132,66 @@ export default function usageExtension(pi: ExtensionAPI): void {
 	});
 
 	pi.registerCommand("usage", {
-		description: "Show provider usage limits; add `simple` for the compact view",
+		description: "Show programming quotas; use `current` or `expanded` for detail",
 		getArgumentCompletions: getUsageArgumentCompletions,
 		handler: async (rawArgs: string, ctx: ExtensionCommandContext) => {
 			const args = splitArgs(rawArgs);
-			const simple = isSimpleArgs(args);
-			const forwardedArgs = simple ? removeSimpleArgs(args) : args;
-			const passthrough = !simple && isPassthroughArgs(forwardedArgs);
-			const wantsJson = !simple && hasArgument(forwardedArgs, "--json");
+			const view = requestedView(args);
+			const forwardedArgs = removeViewArg(args);
+			const wantsJson = hasArgument(forwardedArgs, "--json");
 			const provider = requestedProvider(forwardedArgs);
-			const piProvider = provider?.toLowerCase() === "xai" ? "xai-oauth" : provider;
+			const piProvider = normalizeProvider(provider ?? (view === "current" ? ctx.model?.provider : undefined));
 
 			try {
-				if (simple && forwardedArgs.some(arg => arg === "--history" || arg.startsWith("--history="))) {
-					throw new Error("/usage simple shows the live snapshot; remove --history");
+				if (hasRemovedSimpleArg(args)) throw new Error("`simple` was removed; use `/usage` for the compact view");
+				const removedArgument = forwardedArgs.find(
+					arg => arg === "invalidate" || arg === "--history" || arg.startsWith("--history="),
+				);
+				if (removedArgument) throw new Error(`${removedArgument} is no longer supported; /usage reports Pi-auth quotas only`);
+				if (view === "current" && !piProvider) throw new Error("No active model provider; use `/usage --provider <provider>`");
+				if (provider && !isPiAuthUsageProvider(provider)) {
+					throw new Error(`No direct usage collector for ${provider}; supported providers: ${PI_AUTH_USAGE_PROVIDER_IDS.join(", ")}`);
+				}
+				if (piProvider && !isPiAuthUsageProvider(piProvider)) {
+					throw new Error(`No direct usage collector for ${piProvider}; supported providers: ${PI_AUTH_USAGE_PROVIDER_IDS.join(", ")}`);
 				}
 
-				const executable = process.platform === "win32" ? "omp.exe" : "omp";
-				const commandArgs = !passthrough
-					? ["usage", "--json", ...forwardedArgs.filter(arg => arg !== "--json")]
-					: ["usage", ...forwardedArgs];
-				const piReportsPromise = passthrough
-					? Promise.resolve<SimpleUsageReport[]>([])
-					: collectPiAuthUsageReports(ctx, fetch, piProvider);
-				const skipOmp = !passthrough && isPiAuthUsageProvider(provider);
-				let result: { stdout: string; stderr: string; code: number; killed: boolean };
-				try {
-					result = skipOmp
-						? { stdout: "", stderr: "", code: 0, killed: false }
-						: await pi.exec(executable, commandArgs, { timeout: USAGE_TIMEOUT_MS });
-				} catch (error) {
-					const piReports = await piReportsPromise;
-					if (piReports.length === 0) throw error;
-					result = { stdout: "", stderr: "", code: 1, killed: false };
-				}
-				const piReports = await piReportsPromise;
-				if (result.code !== 0 && piReports.length === 0) throw commandFailure(commandArgs.slice(1), result);
-
-				if (!passthrough) {
-					let payload: Record<string, unknown> = { reports: [] };
-					if (result.code === 0 && result.stdout.trim()) {
-						try {
-							payload = JSON.parse(result.stdout) as Record<string, unknown>;
-						} catch (error) {
-							if (piReports.length === 0) throw error;
-						}
-					}
-					const piReportsForView = hasArgument(forwardedArgs, "--redact")
-						? redactPiAuthUsageReports(piReports)
-						: piReports;
-					const reports = mergePiAuthUsageReports(extractUsageReports(payload), piReportsForView);
-					if (wantsJson) {
-						const overridden = new Set<string>([
-							...PI_AUTH_USAGE_PROVIDER_IDS,
-							...piReportsForView.map(report => report.provider.toLowerCase()),
-						]);
-						const accountsWithoutUsage = Array.isArray(payload.accountsWithoutUsage)
-							? payload.accountsWithoutUsage.filter(account => {
-								const provider = account && typeof account === "object" ? (account as { provider?: unknown }).provider : undefined;
-								return typeof provider !== "string" || !overridden.has(provider.toLowerCase());
-							})
-							: payload.accountsWithoutUsage;
-						pi.sendMessage(
-							{
-								customType: MESSAGE_TYPE,
-								content: JSON.stringify({ ...payload, reports, accountsWithoutUsage }, null, 2),
-								details: { view: "native" },
-								display: true,
-							},
-							{ triggerTurn: false },
-						);
-						return;
-					}
-					const view = simple ? "simple" : "native";
+				const piReports = await collectPiAuthUsageReports(ctx, fetch, piProvider);
+				const reports = hasArgument(forwardedArgs, "--redact")
+					? redactPiAuthUsageReports(piReports)
+					: piReports;
+				if (wantsJson) {
 					pi.sendMessage(
 						{
 							customType: MESSAGE_TYPE,
-							content: formatSimpleUsage(reports, Date.now(), {
-								title: simple ? "Usage (simple)" : "Usage",
-								hideFilteredLimits: simple,
-							}),
-							details: { view, reports },
+							content: JSON.stringify({ reports }, null, 2),
+							details: { view },
 							display: true,
 						},
 						{ triggerTurn: false },
 					);
-				} else {
-					const output = stripAnsi(result.stdout.trim() || result.stderr.trim()) || "No usage output.";
-					pi.sendMessage(
-						{
-							customType: MESSAGE_TYPE,
-							content: output,
-							details: { view: "native" },
-							display: true,
-						},
-						{ triggerTurn: false },
-					);
+					return;
 				}
+				pi.sendMessage(
+					{
+						customType: MESSAGE_TYPE,
+						content: formatSimpleUsage(reports, Date.now(), {
+							title: usageTitle(view),
+							hideFilteredLimits: view === "simple",
+						}),
+						details: { view, reports },
+						display: true,
+					},
+					{ triggerTurn: false },
+				);
 			} catch (error) {
-				const message = stripAnsi(`Usage failed: ${errorMessage(error)}`);
+				const message = `Usage failed: ${errorMessage(error)}`;
 				if (ctx.hasUI) ctx.ui.notify(message, "error");
 				pi.sendMessage(
 					{
 						customType: MESSAGE_TYPE,
 						content: message,
-						details: { view: simple ? "simple" : "native", error: true },
+						details: { view, error: true },
 						display: !ctx.hasUI,
 					},
 					{ triggerTurn: false },

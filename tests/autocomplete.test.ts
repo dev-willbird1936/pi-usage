@@ -1,34 +1,29 @@
 import { expect, test } from "bun:test";
 import { getUsageArgumentCompletions } from "../src/autocomplete.ts";
 
-test("suggests the compact simple view", () => {
+test("suggests expanded usage modes", () => {
 	const result = getUsageArgumentCompletions("");
 	expect(result?.[0]).toMatchObject({
-		value: "simple ",
-		label: "simple",
+		value: "current ",
+		label: "current",
 	});
 });
 
-test("filters the compact view by typed prefix", () => {
-	expect(getUsageArgumentCompletions("si")).toEqual([
-		{
-			value: "simple ",
-			label: "simple",
-			description: "Show compact provider usage and limits",
-		},
-	]);
+test("does not autocomplete the removed simple mode", () => {
+	expect(getUsageArgumentCompletions("si")).toBeNull();
 });
 
 test("completes provider ids after --provider", () => {
 	const all = getUsageArgumentCompletions("--provider ");
-	expect(all?.map(item => item.label)).toContain("anthropic");
-	expect(all?.map(item => item.label)).toContain("google-gemini-cli");
-	expect(all?.map(item => item.label)).toContain("zai");
-	expect(all).toHaveLength(16);
-
-	expect(getUsageArgumentCompletions("--provider open")).toEqual([
-		{ value: "--provider openai-codex ", label: "openai-codex", description: "Only show usage for this provider" },
-		{ value: "--provider opencode-go ", label: "opencode-go", description: "Only show usage for this provider" },
+	expect(all?.map(item => item.label)).toEqual([
+		"anthropic",
+		"cursor",
+		"deepseek",
+		"kimi-coding",
+		"openai-codex",
+		"openrouter",
+		"opencode-go",
+		"xai-oauth",
 	]);
 	expect(getUsageArgumentCompletions("--provider unknown-x")).toBeNull();
 });

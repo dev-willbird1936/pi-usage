@@ -1,13 +1,18 @@
 import { Buffer } from "node:buffer";
 import type { SimpleUsageAmount, SimpleUsageLimit, SimpleUsageReport, SimpleUsageWindow } from "./simple-usage.ts";
 
-/** Minimal Pi context needed to resolve Pi-managed OAuth credentials. */
+/** Minimal Pi context needed to resolve Pi-managed credentials. */
 export interface PiAuthUsageContext {
 	modelRegistry?: {
 		getProviderAuth(provider: string): Promise<
 			| {
-					auth?: { apiKey?: string };
+					auth?: {
+					apiKey?: string;
+					headers?: Record<string, unknown>;
+					baseUrl?: string;
+				};
 					source?: string;
+					accountId?: string;
 				}
 			| undefined
 		>;
@@ -17,7 +22,7 @@ export interface PiAuthUsageContext {
 
 export type PiUsageFetch = typeof fetch;
 
-type PiOAuthAuth = { accessToken: string };
+type PiAuth = { accessToken: string; accountId?: string };
 type PercentBucket = { utilization?: number; resetsAt?: number };
 
 const HOUR_MS = 60 * 60 * 1000;
@@ -29,13 +34,28 @@ const CLAUDE_PROFILE_URL = "https://api.anthropic.com/api/oauth/profile";
 const XAI_BILLING_URL = "https://cli-chat-proxy.grok.com/v1/billing?format=credits";
 const XAI_MONTHLY_BILLING_URL = "https://cli-chat-proxy.grok.com/v1/billing";
 const XAI_USERINFO_URL = "https://auth.x.ai/oauth2/userinfo";
+const CURSOR_USAGE_URL = "https://api2.cursor.sh/aiserver.v1.DashboardService/GetCurrentPeriodUsage";
+const CODEX_USAGE_URL = "https://chatgpt.com/backend-api/wham/usage";
+const KIMI_USAGE_URL = "https://api.kimi.com/coding/v1/usages";
+const OPENROUTER_KEY_URL = "https://openrouter.ai/api/v1/key";
+const DEEPSEEK_BALANCE_URL = "https://api.deepseek.com/user/balance";
+const OPENCODE_USAGE_URL = "https://opencode.ai/zen/go/v1/usage";
 
-/** Providers whose usage requests are always authenticated by Pi. */
-export const PI_AUTH_USAGE_PROVIDER_IDS = ["anthropic", "xai-oauth"] as const;
+/** Providers with direct usage collectors authenticated by Pi. */
+export const PI_AUTH_USAGE_PROVIDER_IDS = [
+	"anthropic",
+	"cursor",
+	"deepseek",
+	"kimi-coding",
+	"openai-codex",
+	"openrouter",
+	"opencode-go",
+	"xai-oauth",
+] as const;
 
 export function isPiAuthUsageProvider(provider: string | undefined): boolean {
 	const normalized = provider?.toLowerCase();
-	return normalized === "anthropic" || normalized === "xai" || normalized === "xai-oauth";
+	return normalized === "xai" || normalized === "xai-oauth" || PI_AUTH_USAGE_PROVIDER_IDS.includes(normalized as (typeof PI_AUTH_USAGE_PROVIDER_IDS)[number]);
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -47,12 +67,21 @@ function text(value: unknown): string | undefined {
 }
 
 function number(value: unknown): number | undefined {
-	return typeof value === "number" && Number.isFinite(value) ? value : undefined;
+	if (typeof value === "number" && Number.isFinite(value)) return value;
+	if (typeof value === "string" && value.trim()) {
+		const parsed = Number(value);
+		return Number.isFinite(parsed) ? parsed : undefined;
+	}
+	return undefined;
 }
 
 function timestamp(value: unknown): number | undefined {
 	if (typeof value === "number" && Number.isFinite(value)) return value > 1_000_000_000_000 ? value : value * 1000;
 	if (typeof value !== "string" || !value.trim()) return undefined;
+	if (/^\d+(?:\.\d+)?$/.test(value.trim())) {
+		const numeric = Number(value);
+		return Number.isFinite(numeric) ? (numeric > 1_000_000_000_000 ? numeric : numeric * 1000) : undefined;
+	}
 	const parsed = Date.parse(value);
 	return Number.isFinite(parsed) ? parsed : undefined;
 }
@@ -99,10 +128,13 @@ async function fetchJson(
 	url: string,
 	headers: Record<string, string>,
 	signal?: AbortSignal,
+	request: { method?: "GET" | "POST"; body?: string } = {},
 ): Promise<unknown | undefined> {
 	try {
 		const response = await fetchImpl(url, {
+			method: request.method,
 			headers,
+			...(request.body !== undefined ? { body: request.body } : {}),
 			redirect: "error",
 			signal: requestSignal(signal),
 		});
@@ -113,16 +145,45 @@ async function fetchJson(
 	}
 }
 
-/** Resolve an OAuth access token from Pi, never from OMP's credential store. */
-async function resolvePiOAuth(context: PiAuthUsageContext, provider: string): Promise<PiOAuthAuth | undefined> {
+function headerValue(headers: Record<string, unknown> | undefined, name: string): string | undefined {
+	if (!headers) return undefined;
+	const wanted = name.toLowerCase();
+	for (const [key, value] of Object.entries(headers)) {
+		if (key.toLowerCase() === wanted && typeof value === "string" && value.trim()) return value.trim();
+	}
+	return undefined;
+}
+
+function hasOfficialOrigin(baseUrl: string | undefined, origins: readonly string[]): boolean {
+	if (!baseUrl) return true;
+	try {
+		return origins.includes(new URL(baseUrl).origin.toLowerCase());
+	} catch {
+		return false;
+	}
+}
+
+/** Resolve credentials from Pi, never from an external credential store. */
+async function resolvePiAuth(
+	context: PiAuthUsageContext,
+	provider: string,
+	options: { oauthOnly?: boolean; origins?: readonly string[] } = {},
+): Promise<PiAuth | undefined> {
 	try {
 		const resolved = await context.modelRegistry?.getProviderAuth(provider);
-		if (!resolved || !/oauth/i.test(resolved.source ?? "")) return undefined;
+		if (!resolved || (options.oauthOnly && !/oauth/i.test(resolved.source ?? ""))) return undefined;
+		if (!hasOfficialOrigin(resolved.auth?.baseUrl, options.origins ?? [])) return undefined;
 		const accessToken = text(resolved.auth?.apiKey);
-		return accessToken ? { accessToken } : undefined;
+		if (!accessToken) return undefined;
+		const accountId = text(resolved.accountId) ?? headerValue(resolved.auth?.headers, "chatgpt-account-id");
+		return { accessToken, ...(accountId ? { accountId } : {}) };
 	} catch {
 		return undefined;
 	}
+}
+
+function bearerHeaders(auth: PiAuth): Record<string, string> {
+	return { Authorization: `Bearer ${auth.accessToken}`, Accept: "application/json" };
 }
 
 function parsePercentBucket(value: unknown): PercentBucket | undefined {
@@ -232,7 +293,7 @@ async function fetchClaudeUsage(
 	context: PiAuthUsageContext,
 	fetchImpl: PiUsageFetch,
 ): Promise<SimpleUsageReport | undefined> {
-	const auth = await resolvePiOAuth(context, "anthropic");
+	const auth = await resolvePiAuth(context, "anthropic", { oauthOnly: true, origins: ["https://api.anthropic.com"] });
 	if (!auth) return undefined;
 	const headers = {
 		accept: "application/json, text/plain, */*",
@@ -338,7 +399,7 @@ function xaiProductName(value: string): string {
 }
 
 async function fetchXaiUsage(context: PiAuthUsageContext, fetchImpl: PiUsageFetch): Promise<SimpleUsageReport | undefined> {
-	const auth = await resolvePiOAuth(context, "xai");
+	const auth = await resolvePiAuth(context, "xai", { oauthOnly: true, origins: ["https://api.x.ai"] });
 	if (!auth) return undefined;
 	const headers = {
 		Authorization: `Bearer ${auth.accessToken}`,
@@ -412,36 +473,286 @@ async function fetchXaiUsage(context: PiAuthUsageContext, fetchImpl: PiUsageFetc
 	};
 }
 
-/** Fetch Claude and Grok usage with Pi's resolved OAuth credentials. */
+function cursorWindow(payload: Record<string, unknown>): SimpleUsageWindow | undefined {
+	const start = timestamp(payload.billingCycleStart);
+	const end = timestamp(payload.billingCycleEnd);
+	if (start === undefined || end === undefined || end <= start) return undefined;
+	return { id: "monthly", label: "Monthly", durationMs: end - start, resetsAt: end };
+}
+
+function cursorMoneyAmount(bucket: Record<string, unknown>): SimpleUsageAmount | undefined {
+	const used = number(bucket.used) ?? number(bucket.includedSpend);
+	const limit = number(bucket.limit);
+	if (used === undefined || limit === undefined || limit <= 0) return undefined;
+	return boundedAmount(used / 100, limit / 100, "usd");
+}
+
+function cursorLimit(
+	id: string,
+	label: string,
+	bucket: Record<string, unknown> | undefined,
+	window: SimpleUsageWindow | undefined,
+): SimpleUsageLimit | undefined {
+	if (!bucket) return undefined;
+	const percent = number(bucket.totalPercentUsed);
+	const amount = percent !== undefined ? percentAmount(percent) : cursorMoneyAmount(bucket);
+	if (!amount) return undefined;
+	return {
+		id,
+		label,
+		scope: { shared: true, ...(window?.id ? { windowId: window.id } : {}) },
+		...(window ? { window } : {}),
+		amount,
+		status: usageStatus(amount.usedFraction ?? 0),
+	};
+}
+
+async function fetchCursorUsage(context: PiAuthUsageContext, fetchImpl: PiUsageFetch): Promise<SimpleUsageReport | undefined> {
+	const auth = await resolvePiAuth(context, "cursor", { oauthOnly: true, origins: ["https://api2.cursor.sh"] });
+	if (!auth) return undefined;
+	const payload = await fetchJson(
+		fetchImpl,
+		CURSOR_USAGE_URL,
+		{ ...bearerHeaders(auth), "Content-Type": "application/json" },
+		context.signal,
+		{ method: "POST", body: "{}" },
+	);
+	if (!isRecord(payload)) return undefined;
+	const window = cursorWindow(payload);
+	const plan = isRecord(payload.planUsage) ? payload.planUsage : undefined;
+	const individual = isRecord(payload.individualUsage) ? payload.individualUsage : undefined;
+	const limits: SimpleUsageLimit[] = [];
+	const add = (limit: SimpleUsageLimit | undefined): void => {
+		if (limit) limits.push(limit);
+	};
+	add(cursorLimit("cursor:plan", "Cursor included usage", plan, window));
+	if (plan) {
+		for (const [id, label, key] of [
+			["cursor:auto", "Cursor Auto", "autoPercentUsed"],
+			["cursor:api", "Cursor API", "apiPercentUsed"],
+		] as const) {
+			const percent = number(plan[key]);
+			if (percent === undefined) continue;
+			const amount = percentAmount(percent);
+			add({ id, label, scope: { windowId: window?.id, shared: false }, ...(window ? { window } : {}), amount, status: usageStatus(amount.usedFraction ?? 0) });
+		}
+	}
+	const onDemand = individual && isRecord(individual.onDemand) ? individual.onDemand : undefined;
+	add(cursorLimit("cursor:on-demand", "Cursor on-demand", onDemand, undefined));
+	if (limits.length === 0) return undefined;
+	return {
+		provider: "cursor",
+		fetchedAt: Date.now(),
+		limits,
+		metadata: {
+			authSource: "pi",
+			...(text(payload.membershipType) ? { membershipType: text(payload.membershipType) } : {}),
+		},
+	};
+}
+
+function codexLimit(
+	groupId: string,
+	groupLabel: string,
+	position: "primary" | "secondary",
+	value: unknown,
+): SimpleUsageLimit | undefined {
+	if (!isRecord(value)) return undefined;
+	const used = number(value.used_percent);
+	if (used === undefined) return undefined;
+	const seconds = number(value.limit_window_seconds);
+	const resetsAt = timestamp(value.reset_at);
+	const id = groupId === "openai-codex" ? `openai-codex:${position}` : `openai-codex:${groupId}:${position}`;
+	const window: SimpleUsageWindow = {
+		id,
+		label: position === "primary" ? "Primary" : "Secondary",
+		...(seconds !== undefined && seconds > 0 ? { durationMs: seconds * 1000 } : {}),
+		...(resetsAt !== undefined ? { resetsAt } : {}),
+	};
+	const amount = percentAmount(used);
+	return {
+		id,
+		label: `${groupLabel} ${position}`,
+		scope: { windowId: id, shared: groupId === "openai-codex", ...(groupId !== "openai-codex" ? { tier: groupId } : {}) },
+		window,
+		amount,
+		status: usageStatus(amount.usedFraction ?? 0),
+	};
+}
+
+async function fetchCodexUsage(context: PiAuthUsageContext, fetchImpl: PiUsageFetch): Promise<SimpleUsageReport | undefined> {
+	const auth = await resolvePiAuth(context, "openai-codex", { oauthOnly: true, origins: ["https://chatgpt.com"] });
+	if (!auth) return undefined;
+	const headers = { ...bearerHeaders(auth), originator: "pi", ...(auth.accountId ? { "chatgpt-account-id": auth.accountId } : {}) };
+	const payload = await fetchJson(fetchImpl, CODEX_USAGE_URL, headers, context.signal);
+	if (!isRecord(payload)) return undefined;
+	const limits: SimpleUsageLimit[] = [];
+	const addGroup = (groupId: string, groupLabel: string, value: unknown): void => {
+		if (!isRecord(value)) return;
+		for (const position of ["primary", "secondary"] as const) {
+			const limit = codexLimit(groupId, groupLabel, position, value[position === "primary" ? "primary_window" : "secondary_window"]);
+			if (limit) limits.push(limit);
+		}
+	};
+	addGroup("openai-codex", "Codex", payload.rate_limit);
+	if (Array.isArray(payload.additional_rate_limits)) {
+		for (const item of payload.additional_rate_limits) {
+			if (!isRecord(item)) continue;
+			const groupId = text(item.metered_feature) ?? text(item.limit_name);
+			if (groupId) addGroup(groupId, text(item.limit_name) ?? groupId, item.rate_limit);
+		}
+	}
+	const credits = isRecord(payload.credits) ? payload.credits : undefined;
+	const balance = credits?.has_credits === true ? number(credits.balance) : undefined;
+	if (balance !== undefined) limits.push({ id: "openai-codex:credits", label: "Codex credits", amount: { remaining: balance, unit: "count" }, status: "ok" });
+	if (limits.length === 0) return undefined;
+	return {
+		provider: "openai-codex",
+		fetchedAt: Date.now(),
+		limits,
+		metadata: { authSource: "pi", ...(text(payload.plan_type) ? { planType: text(payload.plan_type) } : {}), ...(auth.accountId ? { accountId: auth.accountId } : {}) },
+	};
+}
+
+function kimiWindow(raw: unknown, fallbackId: string, fallbackLabel: string, resetValue?: unknown): SimpleUsageWindow | undefined {
+	if (!isRecord(raw)) {
+		const resetsAt = timestamp(resetValue);
+		return fallbackId ? { id: fallbackId, label: fallbackLabel, durationMs: WEEK_MS, ...(resetsAt !== undefined ? { resetsAt } : {}) } : undefined;
+	}
+	const duration = number(raw.duration);
+	const multiplier = raw.timeUnit === "TIME_UNIT_MINUTE" ? 1 : raw.timeUnit === "TIME_UNIT_HOUR" ? 60 : raw.timeUnit === "TIME_UNIT_DAY" ? 24 * 60 : raw.timeUnit === "TIME_UNIT_WEEK" ? 7 * 24 * 60 : undefined;
+	if (duration === undefined || multiplier === undefined || duration <= 0) return undefined;
+	const durationMs = duration * multiplier * 60_000;
+	const resetsAt = timestamp(resetValue) ?? timestamp(raw.resetTime);
+	return Number.isSafeInteger(durationMs) ? { id: `${fallbackId}:${duration * multiplier}m`, label: fallbackLabel, durationMs, ...(resetsAt !== undefined ? { resetsAt } : {}) } : undefined;
+}
+
+function kimiLimit(id: string, label: string, raw: unknown, window: SimpleUsageWindow | undefined, tier?: string): SimpleUsageLimit | undefined {
+	if (!isRecord(raw) || !window) return undefined;
+	const used = number(raw.used);
+	const limit = number(raw.limit);
+	if (used === undefined || limit === undefined || limit <= 0 || !Number.isSafeInteger(used) || !Number.isSafeInteger(limit)) return undefined;
+	const amount = boundedAmount(used, limit, "requests");
+	return amount ? { id, label, scope: { windowId: window.id, shared: tier === undefined, ...(tier ? { tier } : {}) }, window, amount, status: usageStatus(amount.usedFraction ?? 0) } : undefined;
+}
+
+function kimiMoney(value: unknown): number | undefined {
+	const raw = number(value);
+	return raw === undefined || raw < 0 ? undefined : raw / 100_000_000;
+}
+
+async function fetchKimiUsage(context: PiAuthUsageContext, fetchImpl: PiUsageFetch): Promise<SimpleUsageReport | undefined> {
+	const auth = await resolvePiAuth(context, "kimi-coding", { origins: ["https://api.kimi.com"] });
+	if (!auth) return undefined;
+	const payload = await fetchJson(fetchImpl, KIMI_USAGE_URL, bearerHeaders(auth), context.signal);
+	if (!isRecord(payload)) return undefined;
+	const limits: SimpleUsageLimit[] = [];
+	const summaryWindow = kimiWindow(undefined, "weekly", "Weekly", isRecord(payload.usage) ? payload.usage.resetTime : undefined);
+	const summary = kimiLimit("kimi-coding:weekly", "Kimi weekly requests", payload.usage, summaryWindow);
+	if (summary) limits.push(summary);
+	if (Array.isArray(payload.limits)) {
+		payload.limits.forEach((item, index) => {
+			if (!isRecord(item)) return;
+			const detail = isRecord(item.detail) ? item.detail : undefined;
+			const window = kimiWindow(item.window, `detail-${index}`, text(item.name) ?? "Kimi plan window", detail?.resetTime);
+			const minutes = window ? Math.round((window.durationMs ?? 0) / 60_000) : index;
+			const limit = kimiLimit(`kimi-coding:detail:${minutes}:${index}`, text(item.name) ?? "Kimi plan window", detail, window, text(item.name));
+			if (limit) limits.push(limit);
+		});
+	}
+	const wallet = isRecord(payload.boosterWallet) && isRecord(payload.boosterWallet.balance) ? payload.boosterWallet : undefined;
+	if (wallet) {
+		const currency = text(isRecord(wallet.monthlyChargeLimit) ? wallet.monthlyChargeLimit.currency : undefined) ?? text(isRecord(wallet.monthlyUsed) ? wallet.monthlyUsed.currency : undefined) ?? "USD";
+		const balance = kimiMoney(isRecord(wallet.balance) ? wallet.balance.amountLeft : undefined);
+		if (balance !== undefined) limits.push({ id: "kimi-coding:wallet:balance", label: `Kimi extra balance (${currency})`, amount: { remaining: balance, unit: currency.toLowerCase() }, status: "ok" });
+		const monthlyUsed = isRecord(wallet.monthlyUsed) ? number(wallet.monthlyUsed.priceInCents) : undefined;
+		const monthlyLimit = isRecord(wallet.monthlyChargeLimit) ? number(wallet.monthlyChargeLimit.priceInCents) : undefined;
+		if (monthlyUsed !== undefined) limits.push({ id: "kimi-coding:wallet:used", label: "Kimi extra used this month", amount: { used: monthlyUsed / 100, unit: currency.toLowerCase() }, status: "ok" });
+		if (monthlyLimit !== undefined) limits.push({ id: "kimi-coding:wallet:limit", label: "Kimi extra monthly limit", amount: { limit: monthlyLimit / 100, unit: currency.toLowerCase() }, status: "ok" });
+	}
+	if (limits.length === 0) return undefined;
+	return { provider: "kimi-coding", fetchedAt: Date.now(), limits, metadata: { authSource: "pi" } };
+}
+
+async function fetchOpenRouterUsage(context: PiAuthUsageContext, fetchImpl: PiUsageFetch): Promise<SimpleUsageReport | undefined> {
+	const auth = await resolvePiAuth(context, "openrouter", { origins: ["https://openrouter.ai"] });
+	if (!auth) return undefined;
+	const payload = await fetchJson(fetchImpl, OPENROUTER_KEY_URL, bearerHeaders(auth), context.signal);
+	const data = isRecord(payload) && isRecord(payload.data) ? payload.data : undefined;
+	if (!data) return undefined;
+	const limits: SimpleUsageLimit[] = [];
+	const cap = number(data.limit);
+	if (cap !== undefined && cap > 0) {
+		const remaining = number(data.limit_remaining);
+		const used = remaining === undefined ? number(data.usage) : Math.max(0, cap - remaining);
+		const amount = used === undefined ? { limit: cap, unit: "usd" } : boundedAmount(used, cap, "usd");
+		if (amount) limits.push({ id: "openrouter:key-limit", label: "OpenRouter key limit", amount, window: { id: "key", label: "Key limit", ...(timestamp(data.limit_reset) !== undefined ? { resetsAt: timestamp(data.limit_reset) } : {}) }, status: usageStatus(amount.usedFraction ?? 0) });
+	}
+	for (const [field, label] of [["usage_daily", "OpenRouter today"], ["usage_weekly", "OpenRouter this week"], ["usage_monthly", "OpenRouter this month"], ["usage", "OpenRouter all-time"]] as const) {
+		const value = number(data[field]);
+		if (value !== undefined) limits.push({ id: `openrouter:usage:${field}`, label, amount: { used: value, unit: "usd" }, status: "ok" });
+	}
+	if (limits.length === 0) return undefined;
+	return { provider: "openrouter", fetchedAt: Date.now(), limits, metadata: { authSource: "pi", ...(text(data.label) ? { keyLabel: text(data.label) } : {}) } };
+}
+
+async function fetchDeepSeekUsage(context: PiAuthUsageContext, fetchImpl: PiUsageFetch): Promise<SimpleUsageReport | undefined> {
+	const auth = await resolvePiAuth(context, "deepseek", { origins: ["https://api.deepseek.com"] });
+	if (!auth) return undefined;
+	const payload = await fetchJson(fetchImpl, DEEPSEEK_BALANCE_URL, bearerHeaders(auth), context.signal);
+	if (!isRecord(payload) || typeof payload.is_available !== "boolean" || !Array.isArray(payload.balance_infos)) return undefined;
+	const limits: SimpleUsageLimit[] = [];
+	for (const item of payload.balance_infos) {
+		if (!isRecord(item) || (item.currency !== "CNY" && item.currency !== "USD")) continue;
+		const unit = item.currency === "USD" ? "usd" : "cny";
+		for (const [field, label] of [["total_balance", "total"], ["granted_balance", "granted"], ["topped_up_balance", "topped-up"]] as const) {
+			const value = number(item[field]);
+			if (value !== undefined && value >= 0) limits.push({ id: `deepseek:${String(item.currency).toLowerCase()}:${field}`, label: `DeepSeek ${item.currency} ${label}`, amount: { remaining: value, unit }, status: payload.is_available ? "ok" : "warning" });
+		}
+	}
+	if (limits.length === 0) return undefined;
+	return { provider: "deepseek", fetchedAt: Date.now(), limits, metadata: { authSource: "pi", apiAvailable: payload.is_available } };
+}
+
+async function fetchOpenCodeUsage(context: PiAuthUsageContext, fetchImpl: PiUsageFetch): Promise<SimpleUsageReport | undefined> {
+	const auth = await resolvePiAuth(context, "opencode-go", { origins: ["https://opencode.ai"] });
+	if (!auth) return undefined;
+	const payload = await fetchJson(fetchImpl, OPENCODE_USAGE_URL, bearerHeaders(auth), context.signal);
+	const usage = isRecord(payload) && isRecord(payload.usage) ? payload.usage : undefined;
+	if (!usage) return undefined;
+	const limits: SimpleUsageLimit[] = [];
+	for (const [id, label, durationMs] of [["rolling", "OpenCode rolling", 5 * HOUR_MS], ["weekly", "OpenCode weekly", WEEK_MS], ["monthly", "OpenCode monthly", undefined]] as const) {
+		const row = isRecord(usage[id]) ? usage[id] : undefined;
+		const percent = row ? number(row.percent) : undefined;
+		if (percent === undefined) continue;
+		const amount = percentAmount(percent);
+		const resetsAt = row ? timestamp(row.resetsAt) : undefined;
+		limits.push({ id: `opencode-go:${id}`, label, scope: { windowId: id, shared: true }, window: { id, label, ...(durationMs ? { durationMs } : {}), ...(resetsAt !== undefined ? { resetsAt } : {}) }, amount, status: row?.status === "rate-limited" ? "exhausted" : usageStatus(amount.usedFraction ?? 0) });
+	}
+	if (limits.length === 0) return undefined;
+	return { provider: "opencode-go", fetchedAt: Date.now(), limits, metadata: { authSource: "pi" } };
+}
+
+/** Fetch usage only through verified provider endpoints with Pi-resolved credentials. */
 export async function collectPiAuthUsageReports(
 	context: PiAuthUsageContext,
 	fetchImpl: PiUsageFetch = fetch,
 	provider?: string,
 ): Promise<SimpleUsageReport[]> {
-	const requested = provider?.toLowerCase();
+	const requested = provider?.toLowerCase() === "xai" ? "xai-oauth" : provider?.toLowerCase();
 	const collectors: Array<[string, () => Promise<SimpleUsageReport | undefined>]> = [
 		["anthropic", () => fetchClaudeUsage(context, fetchImpl)],
+		["cursor", () => fetchCursorUsage(context, fetchImpl)],
+		["deepseek", () => fetchDeepSeekUsage(context, fetchImpl)],
+		["kimi-coding", () => fetchKimiUsage(context, fetchImpl)],
+		["openai-codex", () => fetchCodexUsage(context, fetchImpl)],
+		["openrouter", () => fetchOpenRouterUsage(context, fetchImpl)],
+		["opencode-go", () => fetchOpenCodeUsage(context, fetchImpl)],
 		["xai-oauth", () => fetchXaiUsage(context, fetchImpl)],
 	];
 	const selected = requested ? collectors.filter(([id]) => id === requested) : collectors;
 	const reports = await Promise.all(selected.map(([, collect]) => collect().catch(() => undefined)));
 	return reports.filter((report): report is SimpleUsageReport => Boolean(report));
-}
-
-/** Prefer Pi-auth reports over OMP reports for Pi-auth-supported providers. */
-export function mergePiAuthUsageReports(
-	ompReports: readonly SimpleUsageReport[],
-	piReports: readonly SimpleUsageReport[],
-): SimpleUsageReport[] {
-	const piAuthProviders = new Set<string>(PI_AUTH_USAGE_PROVIDER_IDS);
-	const reportedProviders = new Set(piReports.map(report => report.provider.toLowerCase()));
-	return [
-		...ompReports.filter(report => {
-			const provider = report.provider.toLowerCase();
-			return !piAuthProviders.has(provider) && !reportedProviders.has(provider);
-		}),
-		...piReports,
-	];
 }
 
 /** Redact identifiers added by direct Pi-auth requests for `--redact`. */

@@ -1,11 +1,9 @@
 import { describe, expect, test } from "bun:test";
 import {
 	estimateRemainingQuotaTime,
-	extractUsageReports,
 	formatSimpleUsage,
 	formatSimpleUsageStyled,
 	isHiddenSimpleLimit,
-	mergeUnreportedAccounts,
 	type SimpleUsageReport,
 } from "../src/simple-usage.ts";
 
@@ -71,7 +69,7 @@ describe("simple usage filtering", () => {
 		expect(isHiddenSimpleLimit(fixture[1], fixture[1].limits![2])).toBe(true);
 	});
 
-	test("hides short windows and Claude Fable details from the simple view", () => {
+	test("keeps main programming windows and hides Claude detail buckets", () => {
 		const report: SimpleUsageReport = {
 			provider: "anthropic",
 			limits: [
@@ -82,10 +80,10 @@ describe("simple usage filtering", () => {
 		};
 		const output = formatSimpleUsage([report], now);
 		expect(output).toContain("Claude 7 Day");
-		expect(output).not.toContain("Claude 5 Hour");
+		expect(output).toContain("Claude 5 Hour");
 		expect(output).not.toContain("Fable");
 		expect(output).toContain("Total usage");
-		expect(output).toContain("20% used · 80% left · 1 quota");
+		expect(output).toContain("15% used · 85% left · 2 quotas");
 		expect(isHiddenSimpleLimit({ provider: "cursor" }, {
 			id: "cursor:short",
 			window: { durationMs: 5 * 60 * 60 * 1000 },
@@ -102,9 +100,8 @@ describe("simple usage filtering", () => {
 			["github-copilot", "copilot:model:gpt-5"],
 			["zai", "zai:features:zread:7d"],
 			["umans", "umans:concurrency"],
-			["opencode-go", "monthly"],
 			["anthropic", "anthropic:7d:fable"],
-			["anthropic", "anthropic:5h"],
+			["anthropic", "anthropic:7d:opus"],
 			["minimax-code", "general:5h"],
 		];
 		for (const [provider, id] of hidden) {
@@ -119,7 +116,7 @@ describe("simple usage filtering", () => {
 
 		const kept: Array<[string, string]> = [
 			["anthropic", "anthropic:7d"],
-			["anthropic", "anthropic:7d:opus"],
+			["anthropic", "anthropic:5h"],
 			["anthropic", "anthropic:extra"],
 			["xai-oauth", "xai-oauth:credits:1w"],
 			["xai-oauth", "xai-oauth:included:1mo"],
@@ -132,20 +129,27 @@ describe("simple usage filtering", () => {
 			["umans", "umans:requests"],
 			["umans", "umans:requests:soft"],
 			["umans", "umans:requests:hard"],
-			["opencode-go", "weekly"],
+			["opencode-go", "monthly"],
 			["alibaba-token-plan", "credits:7d"],
 			["kimi-code", "kimi-code:0"],
 			["minimax-code", "general:7d"],
 			["google-gemini-cli", "gemini-3-pro:quota"],
 			["google-antigravity", "google-antigravity:default:default:7d"],
 			["synthetic", "synthetic:usd:7d"],
-			["cursor", "cursor:usd:individual-auto"],
-			["cursor", "cursor:usd:individual-api"],
-			["cursor", "cursor:usd:individual-ondemand"],
+			["cursor", "cursor:on-demand"],
 		];
 		for (const [provider, id] of kept) {
 			expect(isHiddenSimpleLimit({ provider }, { id })).toBe(false);
 		}
+		expect(isHiddenSimpleLimit({ provider: "openai-codex" }, { id: "openai-codex:primary", window: { durationMs: 5 * 60 * 60 * 1000 } })).toBe(false);
+		expect(isHiddenSimpleLimit({ provider: "opencode-go" }, { id: "opencode-go:monthly" })).toBe(false);
+		expect(isHiddenSimpleLimit({ provider: "deepseek" }, { id: "deepseek:usd:granted_balance" })).toBe(true);
+		expect(isHiddenSimpleLimit({ provider: "openrouter" }, { id: "openrouter:usage:monthly" })).toBe(true);
+		expect(isHiddenSimpleLimit({ provider: "cursor" }, { id: "cursor:auto" })).toBe(true);
+		expect(isHiddenSimpleLimit({ provider: "cursor" }, { id: "cursor:api" })).toBe(true);
+		expect(isHiddenSimpleLimit({ provider: "kimi-coding", limits: [{ id: "kimi-coding:weekly" }] }, { id: "kimi-coding:detail:300:0" })).toBe(true);
+		expect(isHiddenSimpleLimit({ provider: "kimi-coding" }, { id: "kimi-coding:detail:300:0", window: { durationMs: 5 * 60 * 60 * 1000 } })).toBe(false);
+	expect(isHiddenSimpleLimit({ provider: "kimi-coding" }, { id: "kimi-coding:wallet:used" })).toBe(true);
 	});
 
 	test("drops Cursor aggregate rows only when itemized meters exist", () => {
@@ -244,77 +248,6 @@ describe("simple usage filtering", () => {
 		expect(full).not.toContain("Total usage");
 	});
 
-	test("handles the wrapped JSON shape", () => {
-		expect(extractUsageReports({ reports: fixture })).toEqual(fixture);
-		expect(extractUsageReports({ accountsWithoutUsage: [] })).toEqual([]);
-	});
-
-	test("folds accountsWithoutUsage into empty reports instead of dropping them", () => {
-		const payload = {
-			reports: fixture,
-			accountsWithoutUsage: [
-				{
-					provider: "anthropic",
-					type: "oauth",
-					email: "claude@example.test",
-					orgName: "Claude org",
-				},
-				{
-					provider: "xai-oauth",
-					type: "oauth",
-					email: "grok@example.test",
-				},
-			],
-		};
-		const reports = extractUsageReports(payload);
-		expect(reports).toHaveLength(4);
-		expect(reports.map(report => report.provider)).toEqual([
-			"openai-codex",
-			"xai-oauth",
-			"anthropic",
-			"xai-oauth",
-		]);
-
-		const plain = formatSimpleUsage(reports, now);
-		expect(plain).toContain("Claude — claude@example.test · Claude org");
-		expect(plain).toContain("Grok — grok@example.test");
-		expect(plain).toContain("no usage data");
-
-		const styled = formatSimpleUsageStyled(
-			reports,
-			{
-				bold: text => `<bold>${text}</bold>`,
-				fg: (color, text) => `<${color}>${text}</${color}>`,
-			},
-			100,
-			now,
-		);
-		expect(styled).toContain("Claude");
-		expect(styled).toContain("Grok");
-		expect(styled).toContain("claude@example.test · Claude org — no usage data");
-		expect(styled).toContain("grok@example.test — no usage data");
-	});
-
-	test("does not duplicate an unreported account already covered by a report", () => {
-		const merged = mergeUnreportedAccounts(fixture, [
-			{ provider: "xai-oauth", email: "already-covered@example.test" },
-		]);
-		// xAI fixture has no email/accountId, so identity-less coverage does not apply;
-		// an identified sibling account still gets its own empty row.
-		expect(merged).toHaveLength(3);
-
-		const sameIdentity: SimpleUsageReport[] = [
-			{
-				provider: "anthropic",
-				metadata: { email: "claude@example.test" },
-				limits: [{ id: "anthropic:5h", label: "Claude 5 Hour" }],
-			},
-		];
-		expect(mergeUnreportedAccounts(sameIdentity, [
-			{ provider: "anthropic", email: "claude@example.test" },
-		])).toHaveLength(1);
-	});
-
 	test("renders the filtered report with native usage bars and status colors", () => {
 		const styled = formatSimpleUsageStyled(
 			fixture,
@@ -326,7 +259,7 @@ describe("simple usage filtering", () => {
 			now,
 		);
 
-		expect(styled).toContain("Usage (simple)");
+		expect(styled).toContain("Usage");
 		expect(styled).toContain("51% free");
 		expect(styled).toContain("██████████");
 		expect(styled).not.toContain("Models with usage data");

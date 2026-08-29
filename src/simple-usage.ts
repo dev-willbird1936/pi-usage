@@ -44,17 +44,6 @@ export interface SimpleUsageReport {
 	metadata?: Record<string, unknown> | null;
 }
 
-/** Logged-in account whose usage API returned no report (`omp usage --json`). */
-export interface SimpleUsageAccountIdentity {
-	provider: string;
-	type?: string;
-	email?: string;
-	accountId?: string;
-	projectId?: string;
-	orgId?: string;
-	orgName?: string;
-}
-
 export type SimpleUsageThemeColor = "accent" | "dim" | "success" | "warning" | "error";
 
 /** The small part of Pi's Theme used by the usage renderer. */
@@ -65,13 +54,13 @@ export interface SimpleUsageTheme {
 
 /** Presentation options shared by both simple-usage renderers. */
 export interface SimpleUsageViewOptions {
-	/** Header line; defaults to `Usage (simple)`. */
+	/** Header line; defaults to `Usage`. */
 	title?: string;
-	/** Hide provider buckets filtered from the simple view; defaults to true. */
+	/** Hide provider detail buckets; defaults to true. */
 	hideFilteredLimits?: boolean;
 }
 
-const DEFAULT_USAGE_TITLE = "Usage (simple)";
+const DEFAULT_USAGE_TITLE = "Usage";
 
 const PROVIDER_LABELS: Record<string, string> = {
 	"alibaba-token-plan": "Alibaba",
@@ -81,19 +70,19 @@ const PROVIDER_LABELS: Record<string, string> = {
 	"google-antigravity": "Antigravity",
 	"google-gemini-cli": "Gemini",
 	"kimi-code": "Kimi",
+	"kimi-coding": "Kimi Coding",
 	"minimax-code": "MiniMax",
 	ollama: "Ollama",
 	"ollama-cloud": "Ollama Cloud",
 	"openai-codex": "Codex",
+	deepseek: "DeepSeek",
+	openrouter: "OpenRouter",
 	"opencode-go": "OpenCode Go",
 	synthetic: "Synthetic",
 	umans: "Umans",
 	"xai-oauth": "Grok",
 	zai: "Z.ai",
 };
-
-/** Provider ids that expose usage reports, for `--provider` completion. */
-export const USAGE_PROVIDER_IDS: readonly string[] = Object.keys(PROVIDER_LABELS);
 
 const finite = (value: unknown): value is number =>
 	typeof value === "number" && Number.isFinite(value);
@@ -112,29 +101,31 @@ function isXaiProvider(provider: string): boolean {
 }
 
 /**
- * True when a limit is noise for the simple view. Kept rows answer "how much
- * of my subscription is left": account-level quota windows and paid overage.
- * Hidden rows are per-model/per-product breakdowns that duplicate the account
- * aggregate, feature side-quotas, short windows, instantaneous gauges, and
- * display-only windows that never block.
+ * True when a limit is noise for the default programming-quota view. Kept
+ * rows are the provider's main quota or usable balance; detail rows and
+ * accounting breakdowns stay in the expanded view.
  */
 export function isHiddenSimpleLimit(report: SimpleUsageReport, limit: SimpleUsageLimit): boolean {
 	const provider = report.provider.toLowerCase();
 	const id = (limit.id ?? "").toLowerCase();
 
-	// Windows of 24 hours or less are noise in a subscription snapshot; the
-	// longer quota windows answer how much of the plan is left.
+	// Most short windows are detail meters, but these are the actual main
+	// programming quotas for providers that use rolling/session windows.
 	const windowDuration = limit.window?.durationMs;
 	const windowDescription = [limit.window?.id, limit.window?.label, limit.scope?.windowId, limit.label, limit.id]
 		.filter((value): value is string => typeof value === "string")
 		.join(" ");
-	if ((finite(windowDuration) && windowDuration > 0 && windowDuration <= SHORT_WINDOW_MAX_MS) || SHORT_WINDOW_PATTERN.test(windowDescription)) {
+	const mainShortWindow =
+		(provider === "anthropic" && id === "anthropic:5h") ||
+		(provider === "openai-codex" && (id === "openai-codex:primary" || id === "openai-codex:secondary")) ||
+		(provider === "opencode-go" && ["opencode-go:rolling", "opencode-go:weekly", "opencode-go:monthly"].includes(id)) ||
+		(provider === "kimi-coding" && (id === "kimi-coding:weekly" || id.startsWith("kimi-coding:detail:")));
+	if (!mainShortWindow && ((finite(windowDuration) && windowDuration > 0 && windowDuration <= SHORT_WINDOW_MAX_MS) || SHORT_WINDOW_PATTERN.test(windowDescription))) {
 		return true;
 	}
 
-	// Claude's Fable model bucket is a per-model detail, not the account-level
-	// weekly quota shown in the simple view.
-	if (provider === "anthropic" && /\bfable\b/i.test(`${id} ${limit.label ?? ""} ${limit.scope?.tier ?? ""}`)) return true;
+	// Claude model buckets are detail rows; the account-level 5h/7d rows remain.
+	if (provider === "anthropic" && (id.startsWith("anthropic:7d:") || /\bfable\b/i.test(`${id} ${limit.label ?? ""} ${limit.scope?.tier ?? ""}`))) return true;
 
 	// Codex metered-feature buckets (Spark and any future meters): the shared
 	// primary/secondary windows carry the subscription quota; tiered buckets
@@ -142,8 +133,26 @@ export function isHiddenSimpleLimit(report: SimpleUsageReport, limit: SimpleUsag
 	// omit scope.tier.
 	if (provider === "openai-codex") {
 		if (limit.scope?.tier) return true;
-		return `${id} ${limit.label ?? ""}`.toLowerCase().includes("spark");
+		return id === "openai-codex:credits" || `${id} ${limit.label ?? ""}`.toLowerCase().includes("spark");
 	}
+
+	// Cursor Auto/API are itemized meters inside the included plan total.
+	if (provider === "cursor" && (id === "cursor:auto" || id === "cursor:api")) return true;
+
+	// Kimi's detail windows are real programming quotas; hide only a detail row
+	// that repeats the weekly summary. Extra balance is usable; its accounting
+	// components are expanded-only.
+	if (provider === "kimi-coding" && id.startsWith("kimi-coding:detail:")) {
+		const weekly = (report.limits ?? []).find(item => item.id?.toLowerCase() === "kimi-coding:weekly");
+		if (weekly && (!limit.window?.durationMs || !weekly.window?.durationMs || limit.window.durationMs === weekly.window.durationMs)) return true;
+	}
+	if (provider === "kimi-coding" && id.startsWith("kimi-coding:wallet:") && id !== "kimi-coding:wallet:balance") return true;
+
+	// OpenRouter's usage_* fields are spend analytics, not a remaining quota.
+	if (provider === "openrouter" && id.startsWith("openrouter:usage:")) return true;
+
+	// DeepSeek's granted/topped-up balances are components of total balance.
+	if (provider === "deepseek" && (id.includes(":granted_balance") || id.includes(":topped_up_balance"))) return true;
 
 	// xAI per-product credit splits (Grok Build, GrokTasks, API, ...): the
 	// overall SuperGrok credits row already aggregates them.
@@ -159,9 +168,6 @@ export function isHiddenSimpleLimit(report: SimpleUsageReport, limit: SimpleUsag
 	// Umans concurrency is an instantaneous gauge, not a windowed quota.
 	if (provider === "umans" && id === "umans:concurrency") return true;
 
-	// OpenCode Go monthly is display-only: an exhausted monthly never blocks.
-	if (provider === "opencode-go" && (id === "monthly" || limit.window?.id === "monthly")) return true;
-
 	return false;
 }
 
@@ -175,7 +181,7 @@ function isCursorAggregateLimit(limit: SimpleUsageLimit): boolean {
  * Limits visible in the simple view. Context-aware: a Cursor aggregate row
  * ("Personal Usage") is dropped only when the report also carries the
  * itemized meters it duplicates, so a plan with nothing else still renders.
- * Short windows and Claude's Fable model bucket are omitted as details.
+ * Provider-specific detail rows are omitted; main rolling/session quotas stay.
  */
 export function filterSimpleLimits(report: SimpleUsageReport): SimpleUsageLimit[] {
 	const limits = (report.limits ?? []).filter(limit => !isHiddenSimpleLimit(report, limit));
@@ -859,65 +865,4 @@ export function formatSimpleUsageStyled(
 	}
 
 	return lines.join("\n");
-}
-
-function unreportedAccountToReport(account: SimpleUsageAccountIdentity): SimpleUsageReport {
-	return {
-		provider: account.provider,
-		limits: [],
-		metadata: {
-			...(account.email ? { email: account.email } : {}),
-			...(account.accountId ? { accountId: account.accountId } : {}),
-			...(account.projectId ? { projectId: account.projectId } : {}),
-			...(account.orgId ? { orgId: account.orgId } : {}),
-			...(account.orgName ? { orgName: account.orgName } : {}),
-		},
-	};
-}
-
-function identityKeys(value: { email?: unknown; accountId?: unknown; projectId?: unknown } | null | undefined): string[] {
-	return [value?.email, value?.accountId, value?.projectId]
-		.map(textValue)
-		.filter((part): part is string => Boolean(part))
-		.map(part => part.toLowerCase());
-}
-
-/** Fold omp's `accountsWithoutUsage` rows into empty reports so they still render. */
-export function mergeUnreportedAccounts(
-	reports: readonly SimpleUsageReport[],
-	accounts: readonly SimpleUsageAccountIdentity[],
-): SimpleUsageReport[] {
-	if (accounts.length === 0) return [...reports];
-	const extra: SimpleUsageReport[] = [];
-	for (const account of accounts) {
-		if (!account.provider) continue;
-		const provider = account.provider.toLowerCase();
-		const ids = identityKeys(account);
-		const alreadyCovered = reports.some(report => {
-			if (report.provider.toLowerCase() !== provider) return false;
-			if (ids.length === 0) return true;
-			return identityKeys(report.metadata).some(id => ids.includes(id));
-		});
-		if (!alreadyCovered) extra.push(unreportedAccountToReport(account));
-	}
-	return extra.length === 0 ? [...reports] : [...reports, ...extra];
-}
-
-/** Accept both a bare report array and the JSON command's wrapper object. */
-export function extractUsageReports(payload: unknown): SimpleUsageReport[] {
-	if (Array.isArray(payload)) return payload as SimpleUsageReport[];
-	if (!payload || typeof payload !== "object") return [];
-
-	const record = payload as Record<string, unknown>;
-	let reports: SimpleUsageReport[] = [];
-	for (const key of ["reports", "usageReports", "data"]) {
-		if (Array.isArray(record[key])) {
-			reports = record[key] as SimpleUsageReport[];
-			break;
-		}
-	}
-	const unreported = Array.isArray(record.accountsWithoutUsage)
-		? (record.accountsWithoutUsage as SimpleUsageAccountIdentity[])
-		: [];
-	return mergeUnreportedAccounts(reports, unreported);
 }

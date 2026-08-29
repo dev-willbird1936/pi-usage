@@ -2,38 +2,38 @@
 
 A Pi extension by dev-willbird1936 that renders provider usage limits as clean, theme-aware views.
 
-Live Claude and Grok usage uses Pi's resolved OAuth credentials from `ctx.modelRegistry`. The local `omp` CLI remains a fallback for providers without a direct Pi usage collector, so those providers still use their OMP credential store.
+Live Claude and Grok usage uses Pi's resolved OAuth credentials from `ctx.modelRegistry`. The extension has no external usage collector or separate credential store; it reports only providers with direct Pi-auth collectors.
 
 Commands:
 
 ```text
-/usage                  # full styled usage view (all provider limits)
-/usage simple           # compact view without noisy buckets and short windows
-/usage --redact         # full styled view with redacted identifiers
-/usage --history --days 30
-/usage --json           # merged JSON usage report
-/usage invalidate
+/usage                  # compact programming-quota view (default)
+/usage current          # expanded view for the active Pi provider
+/usage expanded         # expanded view for every verified direct provider
+/usage --redact         # compact view with redacted identifiers
+/usage --json           # direct Pi-auth usage report as JSON
 ```
 
-Both live views share the same themed renderer: status icons, quota bars, account columns, reset timers, and `REMAINING` burn-rate estimates drawn with Pi's active theme colors (`accent`, `success`, `warning`, `error`, `dim`) inside a `borderMuted` frame, so they adapt when you switch themes with `/theme`. `REMAINING` is the projected time to quota exhaustion at the current pace; `resets in` remains the provider's actual reset countdown. The simple view ends with `Total usage`, aggregating visible percentage quotas and compatible quantities with used and remaining values. `--history` and `invalidate` keep the raw passthrough (ANSI stripped so the output stays theme-neutral). `--json` returns a merged JSON report so Pi-auth usage can be included alongside OMP reports.
+All views share the same themed renderer: status icons, quota bars, account columns, reset timers, and `REMAINING` burn-rate estimates drawn from Pi's active theme colors (`accent`, `success`, `warning`, `error`, `dim`) inside a `borderMuted` frame. `REMAINING` is the projected time to quota exhaustion at the current pace; `resets in` remains the provider's actual reset countdown. `--json` returns the direct Pi-auth reports as JSON. `/usage simple` was removed; bare `/usage` is now the compact view.
 
 ## Supported providers
 
-The extension currently supports these provider IDs: Alibaba Token Plan, Anthropic (Claude, incl. per-model weekly tiers and Extra Usage), Cursor, GitHub Copilot, Google Antigravity, Google Gemini CLI, Kimi, MiniMax, Ollama / Ollama Cloud, OpenAI Codex, OpenCode Go, Synthetic, Umans, xAI (Grok), and Z.ai. `/usage` shows every reported limit; tab-completion after `/usage --provider` lists all of them. Claude and Grok reports use Pi OAuth auth. OMP-reported logged-in accounts whose usage API returned no limits still render as `no usage data` instead of being omitted.
+The verified direct collectors support Anthropic (Claude), Cursor, DeepSeek, Kimi Coding, OpenAI Codex, OpenRouter, OpenCode Go, and xAI (Grok). `/usage expanded` shows every reported limit; tab-completion after `/usage --provider` lists these providers. Every request resolves credentials through Pi's `ctx.modelRegistry`, and no OMP process or external credential store is used. Providers without a verified Pi-auth usage endpoint are not queried.
 
-## What `/usage simple` cuts
+## What bare `/usage` shows
 
-`/usage simple` is a live snapshot (no `--history`) that keeps only the rows answering "how much of my subscription is left": account-level quota windows and paid overage. Short windows (24 hours or less, such as 5-hour limits) and Claude's Fable model bucket are hidden. It drops rows that only restate those:
+Bare `/usage` is a live programming-quota snapshot. It keeps each provider's main quota or usable balance and hides duplicated detail rows, model/product splits, and spend accounting fields:
 
-- **Codex** — metered-feature buckets (Spark and any future per-feature meters); the shared primary/secondary windows remain.
-- **Grok (xAI)** — per-product credit splits (Grok Build, GrokTasks, API); the overall SuperGrok credits row and on-demand balance remain.
-- **GitHub Copilot** — per-model billing items; Premium Requests (plus Chat/Completions when limited) remains.
-- **Cursor** — the "Personal Usage" aggregate when the itemized monthly meters it duplicates are present.
-- **Z.ai** — feature side-quotas (zread/search bundle); token and request quotas remain.
-- **Umans** — the instantaneous concurrency gauge; request soft/hard caps remain.
-- **OpenCode Go** — the display-only monthly window that never blocks; weekly remains.
+- **Claude** — account 5-hour and 7-day quotas plus Extra Usage; model-tier rows are expanded-only.
+- **Cursor** — included plan and on-demand usage; Auto/API meters are expanded-only.
+- **Codex** — primary and secondary programming windows; Spark/feature meters and credits are expanded-only.
+- **Kimi** — unique plan windows (including 5-hour/daily windows when returned) and extra balance; repeated windows are expanded-only.
+- **OpenRouter** — the key spending limit; daily/weekly/monthly usage analytics are expanded-only.
+- **DeepSeek** — total balance; granted and topped-up components are expanded-only.
+- **OpenCode Go** — rolling, weekly, and monthly quotas.
+- **Grok (xAI)** — overall credits, monthly included usage, and on-demand balance; per-product splits are expanded-only.
 
-All other provider rows remain unless they are short windows or the Claude Fable model bucket.
+GitHub Copilot and Z.ai are intentionally not listed until Pi's signed-in credential and a stable usage endpoint can be verified for them.
 
 ## Install
 
@@ -50,5 +50,3 @@ pi install git:github.com/dev-willbird1936/pi-usage
 ```
 
 Restart Pi or run `/reload`, then use `/usage`.
-
-The `omp` executable is required only for fallback providers. The extension gives that subprocess 120 seconds because the first provider refresh can be slow; Claude and Grok continue to work from Pi auth when `omp` is unavailable.

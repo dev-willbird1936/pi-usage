@@ -1,5 +1,19 @@
 # Changelog
 
+## [0.4.0] - 2026-08-29
+
+- Bare `/usage` is now the default compact programming-quota view; `/usage current` expands the active provider and `/usage expanded` expands every verified direct provider.
+- Removed the `/usage simple` command name.
+- Added verified Pi-auth collectors for Cursor, DeepSeek, Kimi Coding, OpenAI Codex, OpenRouter, and OpenCode Go.
+- All live requests now use credentials resolved from Pi; unsupported providers are not queried.
+
+## [0.3.0] - 2026-08-29
+
+- Removed the OMP subprocess fallback and its separate credential-store dependency.
+- `/usage` now reports only direct Pi-auth collectors for Claude and Grok.
+- Removed the OMP-backed `--history` and `invalidate` passthrough commands.
+- JSON output now contains direct Pi-auth reports only.
+
 ## [0.2.0] - 2026-08-29
 
 - Claude and Grok live usage now resolve OAuth credentials from Pi instead of requiring a matching OMP login. OMP remains a fallback for providers without a direct Pi usage collector.

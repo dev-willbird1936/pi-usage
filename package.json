@@ -1,7 +1,7 @@
 {
   "name": "pi-usage-limits",
-  "version": "0.2.0",
-  "description": "Pi extension that renders provider usage limits as themed compact or full views.",
+  "version": "0.4.0",
+  "description": "Pi extension that renders verified Pi-auth provider usage limits as compact or expanded views.",
   "author": "dev-willbird1936",
   "license": "MIT",
   "keywords": ["pi-package", "pi-extension", "usage", "quota", "rate-limits"],

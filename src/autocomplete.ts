@@ -1,16 +1,16 @@
 import type { AutocompleteItem } from "@earendil-works/pi-tui";
-import { USAGE_PROVIDER_IDS } from "./simple-usage.ts";
+import { PI_AUTH_USAGE_PROVIDER_IDS } from "./pi-auth-usage.ts";
 
 const USAGE_ITEMS: AutocompleteItem[] = [
 	{
-		value: "simple ",
-		label: "simple",
-		description: "Show compact provider usage and limits",
+		value: "current ",
+		label: "current",
+		description: "Show expanded usage for the active provider",
 	},
 	{
-		value: "invalidate ",
-		label: "invalidate",
-		description: "Invalidate cached usage reports",
+		value: "expanded ",
+		label: "expanded",
+		description: "Show every direct provider limit",
 	},
 	{
 		value: "--provider ",
@@ -27,18 +27,13 @@ const USAGE_ITEMS: AutocompleteItem[] = [
 		label: "--redact",
 		description: "Redact account identifiers",
 	},
-	{
-		value: "--history ",
-		label: "--history",
-		description: "Show recorded usage-limit history",
-	},
 ];
 
 export function getUsageArgumentCompletions(prefix: string): AutocompleteItem[] | null {
 	const providerMatch = /^--provider(?:\s+(\S*))?$/i.exec(prefix);
 	if (providerMatch) {
 		const partial = (providerMatch[1] ?? "").toLowerCase();
-		const matches = USAGE_PROVIDER_IDS.filter(id => id.startsWith(partial)).map(id => ({
+		const matches = PI_AUTH_USAGE_PROVIDER_IDS.filter(id => id.startsWith(partial)).map(id => ({
 			value: `--provider ${id} `,
 			label: id,
 			description: "Only show usage for this provider",

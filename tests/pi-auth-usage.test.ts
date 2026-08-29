@@ -1,7 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import {
 	collectPiAuthUsageReports,
-	mergePiAuthUsageReports,
 	type PiAuthUsageContext,
 } from "../src/pi-auth-usage.ts";
 
@@ -84,27 +83,91 @@ describe("Pi-auth usage collection", () => {
 		const reports = await collectPiAuthUsageReports(
 			{
 				modelRegistry: {
-					getProviderAuth: async () => ({ source: "API key", auth: { apiKey: "not-an-oauth-token" } }),
+					getProviderAuth: async provider => provider === "anthropic" ? { source: "API key", auth: { apiKey: "not-an-oauth-token" } } : undefined,
 				},
 			},
 			async () => {
 				requests++;
 				return new Response("{}", { status: 200 });
 			},
+			"anthropic",
 		);
 		expect(reports).toEqual([]);
 		expect(requests).toBe(0);
 	});
 
-	test("does not fall back to an OMP report for Pi-auth providers", () => {
-		const merged = mergePiAuthUsageReports(
-			[
-				{ provider: "anthropic", limits: [{ id: "omp-anthropic" }] },
-				{ provider: "xai-oauth", limits: [{ id: "omp-grok" }] },
-				{ provider: "cursor", limits: [{ id: "omp-cursor" }] },
-			],
-			[],
-		);
-		expect(merged.map(report => report.provider)).toEqual(["cursor"]);
+	test("uses Pi credentials for every verified direct collector", async () => {
+		const tokens: Record<string, string> = {
+			anthropic: "anthropic-token",
+			cursor: "cursor-token",
+			deepseek: "deepseek-token",
+			"kimi-coding": "kimi-token",
+			"openai-codex": "codex-token",
+			openrouter: "openrouter-token",
+			"opencode-go": "opencode-token",
+			xai: "xai-token",
+		};
+		const requests: Array<{ url: string; method?: string; headers: Record<string, string>; body?: string }> = [];
+		const context: PiAuthUsageContext = {
+			modelRegistry: {
+				async getProviderAuth(provider) {
+					const token = tokens[provider];
+					return token ? { source: "OAuth", auth: { apiKey: token } } : undefined;
+				},
+			},
+		};
+		const fetchImpl: typeof fetch = async (input, init) => {
+			const url = String(input);
+			const headers = Object.fromEntries(new Headers(init?.headers).entries());
+			requests.push({ url, method: init?.method, headers, body: typeof init?.body === "string" ? init.body : undefined });
+			if (url.endsWith("/api/oauth/usage")) return jsonResponse({ five_hour: { utilization: 10 }, seven_day: { utilization: 20 }, limits: [] });
+			if (url.endsWith("/api/oauth/profile")) return jsonResponse({});
+			if (url.includes("api2.cursor.sh")) return jsonResponse({
+				billingCycleStart: "2026-08-01T00:00:00Z",
+				billingCycleEnd: "2026-09-01T00:00:00Z",
+				planUsage: { totalPercentUsed: 15, autoPercentUsed: 10, apiPercentUsed: 5 },
+				individualUsage: { onDemand: { used: 10, limit: 100 } },
+			});
+			if (url.endsWith("/user/balance")) return jsonResponse({ is_available: true, balance_infos: [{ currency: "USD", total_balance: "10.00", granted_balance: "1.00", topped_up_balance: "9.00" }] });
+			if (url.endsWith("/coding/v1/usages")) return jsonResponse({ usage: { used: "10", limit: "100" }, limits: [] });
+			if (url.includes("chatgpt.com/backend-api/wham/usage")) return jsonResponse({ rate_limit: { primary_window: { used_percent: 20 }, secondary_window: { used_percent: 30 } } });
+			if (url.endsWith("/api/v1/key")) return jsonResponse({ data: { limit: 10, limit_remaining: 8 } });
+			if (url.endsWith("/zen/go/v1/usage")) return jsonResponse({ usage: { rolling: { percent: 10 }, weekly: { percent: 20 }, monthly: { percent: 30 } } });
+			if (url.includes("billing?format=credits")) return jsonResponse({ config: { currentPeriod: { start: "2026-08-20T00:00:00Z", end: "2026-08-27T00:00:00Z" }, creditUsagePercent: 35, productUsage: [] } });
+			if (url.endsWith("/oauth2/userinfo")) return jsonResponse({ sub: "grok-account" });
+			return new Response("not found", { status: 404 });
+		};
+
+		const reports = await collectPiAuthUsageReports(context, fetchImpl);
+		expect(reports.map(report => report.provider).sort()).toEqual([
+			"anthropic",
+			"cursor",
+			"deepseek",
+			"kimi-coding",
+			"openai-codex",
+			"opencode-go",
+			"openrouter",
+			"xai-oauth",
+		]);
+		expect(requests.find(request => request.url.includes("api2.cursor.sh"))).toMatchObject({
+			method: "POST",
+			body: "{}",
+		});
+		expect(requests.find(request => request.url.includes("chatgpt.com/backend-api"))?.headers).toMatchObject({
+			authorization: "Bearer codex-token",
+			originator: "pi",
+		});
+		for (const [host, token] of Object.entries({
+			"api2.cursor.sh": "cursor-token",
+			"api.deepseek.com": "deepseek-token",
+			"api.kimi.com": "kimi-token",
+			"chatgpt.com": "codex-token",
+			"openrouter.ai": "openrouter-token",
+			"opencode.ai": "opencode-token",
+			"cli-chat-proxy.grok.com": "xai-token",
+		})) {
+			expect(requests.filter(request => request.url.includes(host)).every(request => request.headers.authorization === `Bearer ${token}`)).toBe(true);
+		}
 	});
+
 });
