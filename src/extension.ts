@@ -97,7 +97,7 @@ function normalizeProvider(provider: string | undefined): string | undefined {
 }
 
 function usageTitle(view: UsageView): string {
-	return view === "simple" ? "Usage" : view === "current" ? "Usage (current)" : "Usage (expanded)";
+	return view === "simple" ? "Usage (simple)" : view === "current" ? "Usage (current)" : "Usage (expanded)";
 }
 
 function requestedProvider(args: readonly string[]): string | undefined {

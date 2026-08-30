@@ -6,6 +6,7 @@
 - Removed the `/usage simple` command name.
 - Added verified Pi-auth collectors for Cursor, DeepSeek, Kimi Coding, OpenAI Codex, OpenRouter, and OpenCode Go.
 - All live requests now use credentials resolved from Pi; unsupported providers are not queried.
+- Restored the former compact view's `Usage (simple)` title, short-window filtering, and Cursor/Kimi row labels.
 
 ## [0.3.0] - 2026-08-29
 

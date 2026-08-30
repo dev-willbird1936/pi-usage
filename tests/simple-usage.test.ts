@@ -69,7 +69,7 @@ describe("simple usage filtering", () => {
 		expect(isHiddenSimpleLimit(fixture[1], fixture[1].limits![2])).toBe(true);
 	});
 
-	test("keeps main programming windows and hides Claude detail buckets", () => {
+	test("matches the former compact quota view", () => {
 		const report: SimpleUsageReport = {
 			provider: "anthropic",
 			limits: [
@@ -80,10 +80,10 @@ describe("simple usage filtering", () => {
 		};
 		const output = formatSimpleUsage([report], now);
 		expect(output).toContain("Claude 7 Day");
-		expect(output).toContain("Claude 5 Hour");
+		expect(output).not.toContain("Claude 5 Hour");
 		expect(output).not.toContain("Fable");
 		expect(output).toContain("Total usage");
-		expect(output).toContain("15% used · 85% left · 2 quotas");
+		expect(output).toContain("20% used · 80% left · 1 quota");
 		expect(isHiddenSimpleLimit({ provider: "cursor" }, {
 			id: "cursor:short",
 			window: { durationMs: 5 * 60 * 60 * 1000 },
@@ -116,7 +116,6 @@ describe("simple usage filtering", () => {
 
 		const kept: Array<[string, string]> = [
 			["anthropic", "anthropic:7d"],
-			["anthropic", "anthropic:5h"],
 			["anthropic", "anthropic:extra"],
 			["xai-oauth", "xai-oauth:credits:1w"],
 			["xai-oauth", "xai-oauth:included:1mo"],
@@ -129,7 +128,6 @@ describe("simple usage filtering", () => {
 			["umans", "umans:requests"],
 			["umans", "umans:requests:soft"],
 			["umans", "umans:requests:hard"],
-			["opencode-go", "monthly"],
 			["alibaba-token-plan", "credits:7d"],
 			["kimi-code", "kimi-code:0"],
 			["minimax-code", "general:7d"],
@@ -141,15 +139,13 @@ describe("simple usage filtering", () => {
 		for (const [provider, id] of kept) {
 			expect(isHiddenSimpleLimit({ provider }, { id })).toBe(false);
 		}
-		expect(isHiddenSimpleLimit({ provider: "openai-codex" }, { id: "openai-codex:primary", window: { durationMs: 5 * 60 * 60 * 1000 } })).toBe(false);
-		expect(isHiddenSimpleLimit({ provider: "opencode-go" }, { id: "opencode-go:monthly" })).toBe(false);
+		expect(isHiddenSimpleLimit({ provider: "openai-codex" }, { id: "openai-codex:primary", window: { durationMs: 5 * 60 * 60 * 1000 } })).toBe(true);
+		expect(isHiddenSimpleLimit({ provider: "opencode-go" }, { id: "opencode-go:monthly" })).toBe(true);
 		expect(isHiddenSimpleLimit({ provider: "deepseek" }, { id: "deepseek:usd:granted_balance" })).toBe(true);
 		expect(isHiddenSimpleLimit({ provider: "openrouter" }, { id: "openrouter:usage:monthly" })).toBe(true);
-		expect(isHiddenSimpleLimit({ provider: "cursor" }, { id: "cursor:auto" })).toBe(true);
-		expect(isHiddenSimpleLimit({ provider: "cursor" }, { id: "cursor:api" })).toBe(true);
 		expect(isHiddenSimpleLimit({ provider: "kimi-coding", limits: [{ id: "kimi-coding:weekly" }] }, { id: "kimi-coding:detail:300:0" })).toBe(true);
-		expect(isHiddenSimpleLimit({ provider: "kimi-coding" }, { id: "kimi-coding:detail:300:0", window: { durationMs: 5 * 60 * 60 * 1000 } })).toBe(false);
-	expect(isHiddenSimpleLimit({ provider: "kimi-coding" }, { id: "kimi-coding:wallet:used" })).toBe(true);
+		expect(isHiddenSimpleLimit({ provider: "kimi-coding" }, { id: "kimi-coding:detail:300:0", window: { durationMs: 5 * 60 * 60 * 1000 } })).toBe(true);
+		expect(isHiddenSimpleLimit({ provider: "kimi-coding" }, { id: "kimi-coding:wallet:used" })).toBe(true);
 	});
 
 	test("drops Cursor aggregate rows only when itemized meters exist", () => {

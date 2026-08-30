@@ -73,8 +73,8 @@ test("bare /usage renders the compact direct Pi-auth view", async () => {
 	expect(harness.messages[0].options).toEqual({ triggerTurn: false });
 	expect(harness.messages[0].message.details.reports).toHaveLength(1);
 	expect(harness.messages[0].message.content).toContain("7 Day");
-	expect(harness.messages[0].message.content).toContain("5 Hour");
-	expect(harness.messages[0].message.content).toContain("Usage");
+	expect(harness.messages[0].message.content).not.toContain("5 Hour");
+	expect(harness.messages[0].message.content).toContain("Usage (simple)");
 });
 
 test("/usage current expands the active Pi provider", async () => {

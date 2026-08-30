@@ -54,13 +54,13 @@ export interface SimpleUsageTheme {
 
 /** Presentation options shared by both simple-usage renderers. */
 export interface SimpleUsageViewOptions {
-	/** Header line; defaults to `Usage`. */
+	/** Header line; defaults to the former compact view title. */
 	title?: string;
 	/** Hide provider detail buckets; defaults to true. */
 	hideFilteredLimits?: boolean;
 }
 
-const DEFAULT_USAGE_TITLE = "Usage";
+const DEFAULT_USAGE_TITLE = "Usage (simple)";
 
 const PROVIDER_LABELS: Record<string, string> = {
 	"alibaba-token-plan": "Alibaba",
@@ -70,7 +70,7 @@ const PROVIDER_LABELS: Record<string, string> = {
 	"google-antigravity": "Antigravity",
 	"google-gemini-cli": "Gemini",
 	"kimi-code": "Kimi",
-	"kimi-coding": "Kimi Coding",
+	"kimi-coding": "Kimi",
 	"minimax-code": "MiniMax",
 	ollama: "Ollama",
 	"ollama-cloud": "Ollama Cloud",
@@ -109,22 +109,16 @@ export function isHiddenSimpleLimit(report: SimpleUsageReport, limit: SimpleUsag
 	const provider = report.provider.toLowerCase();
 	const id = (limit.id ?? "").toLowerCase();
 
-	// Most short windows are detail meters, but these are the actual main
-	// programming quotas for providers that use rolling/session windows.
 	const windowDuration = limit.window?.durationMs;
 	const windowDescription = [limit.window?.id, limit.window?.label, limit.scope?.windowId, limit.label, limit.id]
 		.filter((value): value is string => typeof value === "string")
 		.join(" ");
-	const mainShortWindow =
-		(provider === "anthropic" && id === "anthropic:5h") ||
-		(provider === "openai-codex" && (id === "openai-codex:primary" || id === "openai-codex:secondary")) ||
-		(provider === "opencode-go" && ["opencode-go:rolling", "opencode-go:weekly", "opencode-go:monthly"].includes(id)) ||
-		(provider === "kimi-coding" && (id === "kimi-coding:weekly" || id.startsWith("kimi-coding:detail:")));
-	if (!mainShortWindow && ((finite(windowDuration) && windowDuration > 0 && windowDuration <= SHORT_WINDOW_MAX_MS) || SHORT_WINDOW_PATTERN.test(windowDescription))) {
+	if ((finite(windowDuration) && windowDuration > 0 && windowDuration <= SHORT_WINDOW_MAX_MS) || SHORT_WINDOW_PATTERN.test(windowDescription)) {
 		return true;
 	}
 
-	// Claude model buckets are detail rows; the account-level 5h/7d rows remain.
+	// Claude's model buckets are detail rows; the account-level weekly quota
+	// remains visible in the compact view.
 	if (provider === "anthropic" && (id.startsWith("anthropic:7d:") || /\bfable\b/i.test(`${id} ${limit.label ?? ""} ${limit.scope?.tier ?? ""}`))) return true;
 
 	// Codex metered-feature buckets (Spark and any future meters): the shared
@@ -136,9 +130,6 @@ export function isHiddenSimpleLimit(report: SimpleUsageReport, limit: SimpleUsag
 		return id === "openai-codex:credits" || `${id} ${limit.label ?? ""}`.toLowerCase().includes("spark");
 	}
 
-	// Cursor Auto/API are itemized meters inside the included plan total.
-	if (provider === "cursor" && (id === "cursor:auto" || id === "cursor:api")) return true;
-
 	// Kimi's detail windows are real programming quotas; hide only a detail row
 	// that repeats the weekly summary. Extra balance is usable; its accounting
 	// components are expanded-only.
@@ -146,7 +137,7 @@ export function isHiddenSimpleLimit(report: SimpleUsageReport, limit: SimpleUsag
 		const weekly = (report.limits ?? []).find(item => item.id?.toLowerCase() === "kimi-coding:weekly");
 		if (weekly && (!limit.window?.durationMs || !weekly.window?.durationMs || limit.window.durationMs === weekly.window.durationMs)) return true;
 	}
-	if (provider === "kimi-coding" && id.startsWith("kimi-coding:wallet:") && id !== "kimi-coding:wallet:balance") return true;
+	if (provider === "kimi-coding" && id.startsWith("kimi-coding:wallet:")) return true;
 
 	// OpenRouter's usage_* fields are spend analytics, not a remaining quota.
 	if (provider === "openrouter" && id.startsWith("openrouter:usage:")) return true;
@@ -168,20 +159,23 @@ export function isHiddenSimpleLimit(report: SimpleUsageReport, limit: SimpleUsag
 	// Umans concurrency is an instantaneous gauge, not a windowed quota.
 	if (provider === "umans" && id === "umans:concurrency") return true;
 
+	// OpenCode Go monthly is display-only: an exhausted monthly never blocks.
+	if (provider === "opencode-go" && (id === "monthly" || id === "opencode-go:monthly" || limit.window?.id === "monthly")) return true;
+
 	return false;
 }
 
-/** Cursor rows that merely aggregate the other monthly USD meters. */
+/** Cursor rows that merely aggregate the itemized meters. */
 function isCursorAggregateLimit(limit: SimpleUsageLimit): boolean {
 	const id = (limit.id ?? "").toLowerCase();
-	return id === "cursor:usd:individual-plan" || id === "cursor:usd:individual-overall";
+	return id === "cursor:plan" || id === "cursor:usd:individual-plan" || id === "cursor:usd:individual-overall";
 }
 
 /**
  * Limits visible in the simple view. Context-aware: a Cursor aggregate row
  * ("Personal Usage") is dropped only when the report also carries the
  * itemized meters it duplicates, so a plan with nothing else still renders.
- * Provider-specific detail rows are omitted; main rolling/session quotas stay.
+ * Provider-specific detail rows are omitted; longer quota windows stay.
  */
 export function filterSimpleLimits(report: SimpleUsageReport): SimpleUsageLimit[] {
 	const limits = (report.limits ?? []).filter(limit => !isHiddenSimpleLimit(report, limit));
@@ -207,6 +201,7 @@ function accountLabel(report: SimpleUsageReport): string | undefined {
 		metadata.email,
 		metadata.orgName,
 		metadata.organization,
+		metadata.planType,
 		metadata.accountId,
 	].map(textValue).filter((value): value is string => Boolean(value));
 

@@ -112,7 +112,7 @@ describe("Pi-auth usage collection", () => {
 			modelRegistry: {
 				async getProviderAuth(provider) {
 					const token = tokens[provider];
-					return token ? { source: "OAuth", auth: { apiKey: token } } : undefined;
+					return token ? { source: provider === "cursor" ? "stored credential" : "OAuth", auth: { apiKey: token } } : undefined;
 				},
 			},
 		};
@@ -152,6 +152,18 @@ describe("Pi-auth usage collection", () => {
 		expect(requests.find(request => request.url.includes("api2.cursor.sh"))).toMatchObject({
 			method: "POST",
 			body: "{}",
+		});
+		expect(requests.find(request => request.url.includes("api2.cursor.sh"))?.headers).toMatchObject({
+			"connect-protocol-version": "1",
+		});
+		expect(reports.find(report => report.provider === "cursor")?.limits).toEqual(expect.arrayContaining([
+			expect.objectContaining({ id: "cursor:usd:individual-auto", label: "Cursor Models" }),
+			expect.objectContaining({ id: "cursor:usd:individual-api", label: "Other Models" }),
+		]));
+		expect(reports.find(report => report.provider === "kimi-coding")?.limits[0]).toMatchObject({
+			id: "kimi-coding:weekly",
+			label: "Total quota",
+			amount: { unit: "unknown" },
 		});
 		expect(requests.find(request => request.url.includes("chatgpt.com/backend-api"))?.headers).toMatchObject({
 			authorization: "Bearer codex-token",

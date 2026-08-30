@@ -508,12 +508,12 @@ function cursorLimit(
 }
 
 async function fetchCursorUsage(context: PiAuthUsageContext, fetchImpl: PiUsageFetch): Promise<SimpleUsageReport | undefined> {
-	const auth = await resolvePiAuth(context, "cursor", { oauthOnly: true, origins: ["https://api2.cursor.sh"] });
+	const auth = await resolvePiAuth(context, "cursor", { origins: ["https://api2.cursor.sh"] });
 	if (!auth) return undefined;
 	const payload = await fetchJson(
 		fetchImpl,
 		CURSOR_USAGE_URL,
-		{ ...bearerHeaders(auth), "Content-Type": "application/json" },
+		{ ...bearerHeaders(auth), "Content-Type": "application/json", "Connect-Protocol-Version": "1" },
 		context.signal,
 		{ method: "POST", body: "{}" },
 	);
@@ -527,15 +527,20 @@ async function fetchCursorUsage(context: PiAuthUsageContext, fetchImpl: PiUsageF
 	};
 	add(cursorLimit("cursor:plan", "Cursor included usage", plan, window));
 	if (plan) {
-		for (const [id, label, key] of [
-			["cursor:auto", "Cursor Auto", "autoPercentUsed"],
-			["cursor:api", "Cursor API", "apiPercentUsed"],
-		] as const) {
-			const percent = number(plan[key]);
-			if (percent === undefined) continue;
-			const amount = percentAmount(percent);
-			add({ id, label, scope: { windowId: window?.id, shared: false }, ...(window ? { window } : {}), amount, status: usageStatus(amount.usedFraction ?? 0) });
+		const autoPercent = number(plan.autoPercentUsed);
+		if (autoPercent !== undefined) {
+			const amount = percentAmount(autoPercent);
+			add({ id: "cursor:usd:individual-auto", label: "Cursor Models", scope: { windowId: window?.id, shared: false }, ...(window ? { window } : {}), amount, status: usageStatus(amount.usedFraction ?? 0) });
 		}
+		const apiPercent = number(plan.apiPercentUsed);
+		const planLimit = number(plan.limit);
+		const apiAmount =
+			apiPercent !== undefined && planLimit !== undefined && planLimit > 0
+				? boundedAmount((planLimit * Math.min(Math.max(apiPercent, 0), 100)) / 100 / 100, planLimit / 100, "usd")
+				: apiPercent !== undefined
+					? percentAmount(apiPercent)
+					: undefined;
+		if (apiAmount) add({ id: "cursor:usd:individual-api", label: "Other Models", scope: { windowId: window?.id, shared: false }, ...(window ? { window } : {}), amount: apiAmount, status: usageStatus(apiAmount.usedFraction ?? 0) });
 	}
 	const onDemand = individual && isRecord(individual.onDemand) ? individual.onDemand : undefined;
 	add(cursorLimit("cursor:on-demand", "Cursor on-demand", onDemand, undefined));
@@ -606,11 +611,18 @@ async function fetchCodexUsage(context: PiAuthUsageContext, fetchImpl: PiUsageFe
 	const balance = credits?.has_credits === true ? number(credits.balance) : undefined;
 	if (balance !== undefined) limits.push({ id: "openai-codex:credits", label: "Codex credits", amount: { remaining: balance, unit: "count" }, status: "ok" });
 	if (limits.length === 0) return undefined;
+	const tokenIdentity = jwtPayload(auth.accessToken);
+	const accountId = text(payload.account_id) ?? auth.accountId ?? text(tokenIdentity?.account_id);
 	return {
 		provider: "openai-codex",
 		fetchedAt: Date.now(),
 		limits,
-		metadata: { authSource: "pi", ...(text(payload.plan_type) ? { planType: text(payload.plan_type) } : {}), ...(auth.accountId ? { accountId: auth.accountId } : {}) },
+		metadata: {
+			authSource: "pi",
+			...(text(payload.email) ? { email: text(payload.email) } : {}),
+			...(text(payload.plan_type) ? { planType: text(payload.plan_type) } : {}),
+			...(accountId ? { accountId } : {}),
+		},
 	};
 }
 
@@ -632,7 +644,7 @@ function kimiLimit(id: string, label: string, raw: unknown, window: SimpleUsageW
 	const used = number(raw.used);
 	const limit = number(raw.limit);
 	if (used === undefined || limit === undefined || limit <= 0 || !Number.isSafeInteger(used) || !Number.isSafeInteger(limit)) return undefined;
-	const amount = boundedAmount(used, limit, "requests");
+	const amount = boundedAmount(used, limit, "unknown");
 	return amount ? { id, label, scope: { windowId: window.id, shared: tier === undefined, ...(tier ? { tier } : {}) }, window, amount, status: usageStatus(amount.usedFraction ?? 0) } : undefined;
 }
 
@@ -647,8 +659,8 @@ async function fetchKimiUsage(context: PiAuthUsageContext, fetchImpl: PiUsageFet
 	const payload = await fetchJson(fetchImpl, KIMI_USAGE_URL, bearerHeaders(auth), context.signal);
 	if (!isRecord(payload)) return undefined;
 	const limits: SimpleUsageLimit[] = [];
-	const summaryWindow = kimiWindow(undefined, "weekly", "Weekly", isRecord(payload.usage) ? payload.usage.resetTime : undefined);
-	const summary = kimiLimit("kimi-coding:weekly", "Kimi weekly requests", payload.usage, summaryWindow);
+	const summaryWindow = kimiWindow(undefined, "weekly", "7 Day", isRecord(payload.usage) ? payload.usage.resetTime : undefined);
+	const summary = kimiLimit("kimi-coding:weekly", "Total quota", payload.usage, summaryWindow);
 	if (summary) limits.push(summary);
 	if (Array.isArray(payload.limits)) {
 		payload.limits.forEach((item, index) => {
@@ -671,7 +683,9 @@ async function fetchKimiUsage(context: PiAuthUsageContext, fetchImpl: PiUsageFet
 		if (monthlyLimit !== undefined) limits.push({ id: "kimi-coding:wallet:limit", label: "Kimi extra monthly limit", amount: { limit: monthlyLimit / 100, unit: currency.toLowerCase() }, status: "ok" });
 	}
 	if (limits.length === 0) return undefined;
-	return { provider: "kimi-coding", fetchedAt: Date.now(), limits, metadata: { authSource: "pi" } };
+	const tokenIdentity = jwtPayload(auth.accessToken);
+	const accountId = text(payload.accountId) ?? text(payload.userId) ?? text(tokenIdentity?.user_id) ?? text(tokenIdentity?.sub);
+	return { provider: "kimi-coding", fetchedAt: Date.now(), limits, metadata: { authSource: "pi", ...(accountId ? { accountId } : {}) } };
 }
 
 async function fetchOpenRouterUsage(context: PiAuthUsageContext, fetchImpl: PiUsageFetch): Promise<SimpleUsageReport | undefined> {

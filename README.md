@@ -2,7 +2,7 @@
 
 A Pi extension by dev-willbird1936 that renders provider usage limits as clean, theme-aware views.
 
-Live Claude and Grok usage uses Pi's resolved OAuth credentials from `ctx.modelRegistry`. The extension has no external usage collector or separate credential store; it reports only providers with direct Pi-auth collectors.
+Live usage resolves Pi's signed-in credentials through `ctx.modelRegistry`. The extension has no external usage collector or separate credential store; it reports only providers with direct Pi-auth collectors.
 
 Commands:
 
@@ -24,13 +24,13 @@ The verified direct collectors support Anthropic (Claude), Cursor, DeepSeek, Kim
 
 Bare `/usage` is a live programming-quota snapshot. It keeps each provider's main quota or usable balance and hides duplicated detail rows, model/product splits, and spend accounting fields:
 
-- **Claude** — account 5-hour and 7-day quotas plus Extra Usage; model-tier rows are expanded-only.
-- **Cursor** — included plan and on-demand usage; Auto/API meters are expanded-only.
-- **Codex** — primary and secondary programming windows; Spark/feature meters and credits are expanded-only.
-- **Kimi** — unique plan windows (including 5-hour/daily windows when returned) and extra balance; repeated windows are expanded-only.
+- **Claude** — the account 7-day quota plus Extra Usage; 5-hour and model-tier rows are expanded-only.
+- **Cursor** — the main `Cursor Models` and `Other Models` meters; aggregate detail is expanded-only.
+- **Codex** — the longer primary/secondary programming windows; short windows, Spark/feature meters, and credits are expanded-only.
+- **Kimi** — the main weekly quota; short/detail windows and extra balance are expanded-only.
 - **OpenRouter** — the key spending limit; daily/weekly/monthly usage analytics are expanded-only.
 - **DeepSeek** — total balance; granted and topped-up components are expanded-only.
-- **OpenCode Go** — rolling, weekly, and monthly quotas.
+- **OpenCode Go** — the weekly quota; rolling and monthly rows are expanded-only.
 - **Grok (xAI)** — overall credits, monthly included usage, and on-demand balance; per-product splits are expanded-only.
 
 GitHub Copilot and Z.ai are intentionally not listed until Pi's signed-in credential and a stable usage endpoint can be verified for them.
