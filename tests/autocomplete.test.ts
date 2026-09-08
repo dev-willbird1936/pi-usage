@@ -24,6 +24,7 @@ test("completes provider ids after --provider", () => {
 		"openrouter",
 		"opencode-go",
 		"xai-oauth",
+		"claude-bridge",
 	]);
 	expect(getUsageArgumentCompletions("--provider unknown-x")).toBeNull();
 });

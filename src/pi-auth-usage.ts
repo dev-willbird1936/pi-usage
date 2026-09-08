@@ -1,8 +1,20 @@
 import { Buffer } from "node:buffer";
+import { readFileSync } from "node:fs";
+import { homedir } from "node:os";
+import { join } from "node:path";
 import type { SimpleUsageAmount, SimpleUsageLimit, SimpleUsageReport, SimpleUsageWindow } from "./simple-usage.ts";
 
-/** Minimal Pi context needed to resolve Pi-managed credentials. */
+/** Minimal context needed to resolve Pi and Claude Code usage credentials. */
 export interface PiAuthUsageContext {
+	readStoredCredential?: (provider: string) => {
+		type?: string;
+		access?: string;
+		expires?: unknown;
+		expiresAt?: unknown;
+	} | undefined;
+	/** Read Claude Code's OAuth token only when the claude-bridge provider is requested. */
+	readClaudeCodeAccessToken?: () => string | undefined;
+	allowClaudeCodeFallback?: boolean;
 	modelRegistry?: {
 		getProviderAuth(provider: string): Promise<
 			| {
@@ -53,9 +65,33 @@ export const PI_AUTH_USAGE_PROVIDER_IDS = [
 	"xai-oauth",
 ] as const;
 
+/** Provider IDs exposed by `/usage`; aliases are accepted by the command too. */
+export const USAGE_PROVIDER_IDS = [...PI_AUTH_USAGE_PROVIDER_IDS, "claude-bridge"] as const;
+
+/** Provider names that can route to one of the canonical usage collectors. */
+const USAGE_PROVIDER_ALIASES: Record<string, string> = {
+	anthropic: "anthropic",
+	claude: "anthropic",
+	"claude-code": "anthropic",
+	"claude-bridge": "anthropic",
+	xai: "xai-oauth",
+	"xai-cliproxy": "xai-oauth",
+	"cursor-cliproxy": "cursor",
+	"deepseek-cliproxy": "deepseek",
+	"kimi-code": "kimi-coding",
+	"kimi-cliproxy": "kimi-coding",
+	"openrouter-cliproxy": "openrouter",
+	opencode: "opencode-go",
+};
+
+function normalizeUsageProvider(provider: string | undefined): string | undefined {
+	const normalized = provider?.trim().toLowerCase();
+	return normalized ? USAGE_PROVIDER_ALIASES[normalized] ?? normalized : undefined;
+}
+
 export function isPiAuthUsageProvider(provider: string | undefined): boolean {
-	const normalized = provider?.toLowerCase();
-	return normalized === "xai" || normalized === "xai-oauth" || PI_AUTH_USAGE_PROVIDER_IDS.includes(normalized as (typeof PI_AUTH_USAGE_PROVIDER_IDS)[number]);
+	const normalized = normalizeUsageProvider(provider);
+	return normalized !== undefined && PI_AUTH_USAGE_PROVIDER_IDS.includes(normalized as (typeof PI_AUTH_USAGE_PROVIDER_IDS)[number]);
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -64,6 +100,22 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 
 function text(value: unknown): string | undefined {
 	return typeof value === "string" && value.trim() ? value.trim() : undefined;
+}
+
+/**
+ * Read the OAuth token used by Claude Code's bridge provider. It is used only
+ * as a fallback when a Pi Anthropic credential is unavailable.
+ */
+export function readClaudeCodeAccessToken(): string | undefined {
+	try {
+		const configuredDir = typeof process !== "undefined" ? process.env.CLAUDE_CONFIG_DIR?.trim() : undefined;
+		const credentialsPath = join(configuredDir || join(homedir(), ".claude"), ".credentials.json");
+		const payload = JSON.parse(readFileSync(credentialsPath, "utf8")) as unknown;
+		if (!isRecord(payload) || !isRecord(payload.claudeAiOauth)) return undefined;
+		return text(payload.claudeAiOauth.accessToken);
+	} catch {
+		return undefined;
+	}
 }
 
 function number(value: unknown): number | undefined {
@@ -123,13 +175,29 @@ function requestSignal(signal?: AbortSignal): AbortSignal {
 	return signal ? AbortSignal.any([signal, timeout]) : timeout;
 }
 
+type JsonFetchResult = { value: unknown } | { error: string };
+
+function safeUsageError(error: unknown): string {
+	const message = error instanceof Error ? error.message : String(error);
+	return message.replace(/[\r\n]+/g, " ").trim().slice(0, 160) || "request failed";
+}
+
+function failedReport(provider: string, error: string): SimpleUsageReport {
+	return {
+		provider,
+		fetchedAt: Date.now(),
+		limits: [],
+		error: `Usage unavailable: ${safeUsageError(error)}`,
+	};
+}
+
 async function fetchJson(
 	fetchImpl: PiUsageFetch,
 	url: string,
 	headers: Record<string, string>,
 	signal?: AbortSignal,
 	request: { method?: "GET" | "POST"; body?: string } = {},
-): Promise<unknown | undefined> {
+): Promise<JsonFetchResult> {
 	try {
 		const response = await fetchImpl(url, {
 			method: request.method,
@@ -138,10 +206,14 @@ async function fetchJson(
 			redirect: "error",
 			signal: requestSignal(signal),
 		});
-		if (!response.ok) return undefined;
-		return await response.json();
-	} catch {
-		return undefined;
+		if (!response.ok) return { error: `HTTP ${response.status}` };
+		try {
+			return { value: await response.json() };
+		} catch {
+			return { error: "invalid JSON response" };
+		}
+	} catch (error) {
+		return { error: safeUsageError(error) };
 	}
 }
 
@@ -163,23 +235,45 @@ function hasOfficialOrigin(baseUrl: string | undefined, origins: readonly string
 	}
 }
 
-/** Resolve credentials from Pi, never from an external credential store. */
+/** Resolve credentials through Pi first so its OAuth resolver can refresh expired tokens. */
 async function resolvePiAuth(
 	context: PiAuthUsageContext,
 	provider: string,
 	options: { oauthOnly?: boolean; origins?: readonly string[] } = {},
 ): Promise<PiAuth | undefined> {
+	let resolved:
+		| {
+				auth?: { apiKey?: string; headers?: Record<string, unknown>; baseUrl?: string };
+				source?: string;
+				accountId?: string;
+		  }
+		| undefined;
 	try {
-		const resolved = await context.modelRegistry?.getProviderAuth(provider);
-		if (!resolved || (options.oauthOnly && !/oauth/i.test(resolved.source ?? ""))) return undefined;
-		if (!hasOfficialOrigin(resolved.auth?.baseUrl, options.origins ?? [])) return undefined;
-		const accessToken = text(resolved.auth?.apiKey);
-		if (!accessToken) return undefined;
-		const accountId = text(resolved.accountId) ?? headerValue(resolved.auth?.headers, "chatgpt-account-id");
-		return { accessToken, ...(accountId ? { accountId } : {}) };
+		resolved = await context.modelRegistry?.getProviderAuth(provider);
 	} catch {
-		return undefined;
+		resolved = undefined;
 	}
+	if (resolved && (!options.oauthOnly || /oauth/i.test(resolved.source ?? "")) && hasOfficialOrigin(resolved.auth?.baseUrl, options.origins ?? [])) {
+		const accessToken = text(resolved.auth?.apiKey);
+		if (accessToken) {
+			const accountId = text(resolved.accountId) ?? headerValue(resolved.auth?.headers, "chatgpt-account-id");
+			return { accessToken, ...(accountId ? { accountId } : {}) };
+		}
+	}
+
+	// Stored credentials are a compatibility fallback when registry resolution is unavailable.
+	// Do not use an expired snapshot; normal OAuth refresh belongs to Pi's registry.
+	try {
+		const stored = context.readStoredCredential?.(provider);
+		const expiry = timestamp(stored?.expiresAt ?? stored?.expires);
+		const accessToken = text(stored?.access);
+		if (stored?.type === "oauth" && accessToken && (expiry === undefined || expiry > Date.now())) {
+			return { accessToken };
+		}
+	} catch {
+		// No usable stored credential.
+	}
+	return undefined;
 }
 
 function bearerHeaders(auth: PiAuth): Record<string, string> {
@@ -294,19 +388,33 @@ async function fetchClaudeUsage(
 	fetchImpl: PiUsageFetch,
 ): Promise<SimpleUsageReport | undefined> {
 	const auth = await resolvePiAuth(context, "anthropic", { oauthOnly: true, origins: ["https://api.anthropic.com"] });
-	if (!auth) return undefined;
+	let accessToken = auth?.accessToken;
+	let authSource = "pi";
+	if (!accessToken && context.allowClaudeCodeFallback === true) {
+		try {
+			accessToken = text(context.readClaudeCodeAccessToken?.());
+		} catch {
+			accessToken = undefined;
+		}
+		if (accessToken) authSource = "claude-code";
+	}
+	if (!accessToken) return undefined;
 	const headers = {
 		accept: "application/json, text/plain, */*",
 		"anthropic-beta":
 			"claude-code-20250219,oauth-2025-04-20,interleaved-thinking-2025-05-14,redact-thinking-2026-02-12,context-management-2025-06-27,prompt-caching-scope-2026-01-05,mid-conversation-system-2026-04-07,advanced-tool-use-2025-11-20,effort-2025-11-24,extended-cache-ttl-2025-04-11",
 		"user-agent": "claude-cli/2.1.220 (external, cli)",
-		authorization: `Bearer ${auth.accessToken}`,
+		authorization: `Bearer ${accessToken}`,
 	};
-	const [usagePayload, profilePayload] = await Promise.all([
+	const [usageResponse, profileResponse] = await Promise.all([
 		fetchJson(fetchImpl, CLAUDE_USAGE_URL, headers, context.signal),
 		fetchJson(fetchImpl, CLAUDE_PROFILE_URL, headers, context.signal),
 	]);
-	if (!isRecord(usagePayload)) return undefined;
+	if ("error" in usageResponse) return failedReport("anthropic", usageResponse.error);
+	const usagePayload = usageResponse.value;
+	if (!isRecord(usagePayload)) return failedReport("anthropic", "invalid usage payload");
+	const profilePayload = "value" in profileResponse ? profileResponse.value : undefined;
+	const notes = "error" in profileResponse ? [`Profile unavailable: ${profileResponse.error}`] : undefined;
 
 	const entries = Array.isArray(usagePayload.limits)
 		? usagePayload.limits
@@ -346,7 +454,7 @@ async function fetchClaudeUsage(
 		);
 	}
 	add(claudeExtraLimit(usagePayload));
-	if (limits.length === 0) return undefined;
+	if (limits.length === 0) return failedReport("anthropic", "no recognized usage limits");
 
 	const usageIdentity = parseClaudeIdentity(usagePayload);
 	const profileIdentity = isRecord(profilePayload) ? parseClaudeIdentity(profilePayload) : {};
@@ -360,8 +468,9 @@ async function fetchClaudeUsage(
 		provider: "anthropic",
 		fetchedAt: Date.now(),
 		limits,
+		...(notes ? { notes } : {}),
 		metadata: {
-			authSource: "pi",
+			authSource,
 			...(identity.accountId ? { accountId: identity.accountId } : {}),
 			...(identity.email ? { email: identity.email } : {}),
 			...(identity.orgId ? { orgId: identity.orgId } : {}),
@@ -406,10 +515,15 @@ async function fetchXaiUsage(context: PiAuthUsageContext, fetchImpl: PiUsageFetc
 		Accept: "application/json",
 		"X-XAI-Token-Auth": "xai-grok-cli",
 	};
-	const [weeklyPayload, identityPayload] = await Promise.all([
+	const [weeklyResponse, identityResponse] = await Promise.all([
 		fetchJson(fetchImpl, XAI_BILLING_URL, headers, context.signal),
 		fetchJson(fetchImpl, XAI_USERINFO_URL, { Authorization: `Bearer ${auth.accessToken}`, Accept: "application/json" }, context.signal),
 	]);
+	const errors: string[] = [];
+	if ("error" in weeklyResponse) errors.push(`Weekly billing unavailable: ${weeklyResponse.error}`);
+	if ("error" in identityResponse) errors.push(`Identity unavailable: ${identityResponse.error}`);
+	const weeklyPayload = "value" in weeklyResponse ? weeklyResponse.value : undefined;
+	const identityPayload = "value" in identityResponse ? identityResponse.value : undefined;
 	const weeklyConfig = isRecord(weeklyPayload) && isRecord(weeklyPayload.config) ? weeklyPayload.config : undefined;
 	const identity = isRecord(identityPayload) ? identityPayload : undefined;
 	const tokenIdentity = jwtPayload(auth.accessToken);
@@ -454,7 +568,9 @@ async function fetchXaiUsage(context: PiAuthUsageContext, fetchImpl: PiUsageFetc
 
 	const shouldProbeMonthly = limits.length === 0 || weeklyConfig?.isUnifiedBillingUser === true;
 	if (shouldProbeMonthly) {
-		const monthlyPayload = await fetchJson(fetchImpl, XAI_MONTHLY_BILLING_URL, headers, context.signal);
+		const monthlyResponse = await fetchJson(fetchImpl, XAI_MONTHLY_BILLING_URL, headers, context.signal);
+		if ("error" in monthlyResponse) errors.push(`Monthly billing unavailable: ${monthlyResponse.error}`);
+		const monthlyPayload = "value" in monthlyResponse ? monthlyResponse.value : undefined;
 		const monthlyConfig = isRecord(monthlyPayload) && isRecord(monthlyPayload.config) ? monthlyPayload.config : undefined;
 		const monthlyWindow = monthlyConfig ? xaiWindow(monthlyConfig.billingPeriodStart, monthlyConfig.billingPeriodEnd, "1mo", "Monthly") : undefined;
 		const used = monthlyConfig ? xaiAmount(monthlyConfig.used) : undefined;
@@ -464,11 +580,12 @@ async function fetchXaiUsage(context: PiAuthUsageContext, fetchImpl: PiUsageFetc
 			limits.push({ id: "xai-oauth:included:1mo", label: "SuperGrok Monthly Included", scope: { windowId: monthlyWindow.id, shared: true, ...(accountId ? { accountId } : {}) }, window: monthlyWindow, amount, status: usageStatus(amount.usedFraction ?? 0) });
 		}
 	}
-	if (limits.length === 0) return undefined;
+	if (limits.length === 0) return failedReport("xai-oauth", errors.join("; ") || "no recognized usage limits");
 	return {
 		provider: "xai-oauth",
 		fetchedAt: Date.now(),
 		limits,
+		...(errors.length > 0 ? { notes: errors } : {}),
 		metadata: { authSource: "pi", ...(accountId ? { accountId } : {}), ...(email ? { email } : {}) },
 	};
 }
@@ -510,14 +627,16 @@ function cursorLimit(
 async function fetchCursorUsage(context: PiAuthUsageContext, fetchImpl: PiUsageFetch): Promise<SimpleUsageReport | undefined> {
 	const auth = await resolvePiAuth(context, "cursor", { origins: ["https://api2.cursor.sh"] });
 	if (!auth) return undefined;
-	const payload = await fetchJson(
+	const response = await fetchJson(
 		fetchImpl,
 		CURSOR_USAGE_URL,
 		{ ...bearerHeaders(auth), "Content-Type": "application/json", "Connect-Protocol-Version": "1" },
 		context.signal,
 		{ method: "POST", body: "{}" },
 	);
-	if (!isRecord(payload)) return undefined;
+	if ("error" in response) return failedReport("cursor", response.error);
+	const payload = response.value;
+	if (!isRecord(payload)) return failedReport("cursor", "invalid usage payload");
 	const window = cursorWindow(payload);
 	const plan = isRecord(payload.planUsage) ? payload.planUsage : undefined;
 	const individual = isRecord(payload.individualUsage) ? payload.individualUsage : undefined;
@@ -544,7 +663,7 @@ async function fetchCursorUsage(context: PiAuthUsageContext, fetchImpl: PiUsageF
 	}
 	const onDemand = individual && isRecord(individual.onDemand) ? individual.onDemand : undefined;
 	add(cursorLimit("cursor:on-demand", "Cursor on-demand", onDemand, undefined));
-	if (limits.length === 0) return undefined;
+	if (limits.length === 0) return failedReport("cursor", "no recognized usage limits");
 	return {
 		provider: "cursor",
 		fetchedAt: Date.now(),
@@ -577,7 +696,7 @@ function codexLimit(
 	const amount = percentAmount(used);
 	return {
 		id,
-		label: `${groupLabel} ${position}`,
+		label: groupId === "openai-codex" && seconds === WEEK_MS / 1000 ? "7 days" : `${groupLabel} ${position}`,
 		scope: { windowId: id, shared: groupId === "openai-codex", ...(groupId !== "openai-codex" ? { tier: groupId } : {}) },
 		window,
 		amount,
@@ -589,8 +708,10 @@ async function fetchCodexUsage(context: PiAuthUsageContext, fetchImpl: PiUsageFe
 	const auth = await resolvePiAuth(context, "openai-codex", { oauthOnly: true, origins: ["https://chatgpt.com"] });
 	if (!auth) return undefined;
 	const headers = { ...bearerHeaders(auth), originator: "pi", ...(auth.accountId ? { "chatgpt-account-id": auth.accountId } : {}) };
-	const payload = await fetchJson(fetchImpl, CODEX_USAGE_URL, headers, context.signal);
-	if (!isRecord(payload)) return undefined;
+	const response = await fetchJson(fetchImpl, CODEX_USAGE_URL, headers, context.signal);
+	if ("error" in response) return failedReport("openai-codex", response.error);
+	const payload = response.value;
+	if (!isRecord(payload)) return failedReport("openai-codex", "invalid usage payload");
 	const limits: SimpleUsageLimit[] = [];
 	const addGroup = (groupId: string, groupLabel: string, value: unknown): void => {
 		if (!isRecord(value)) return;
@@ -610,7 +731,7 @@ async function fetchCodexUsage(context: PiAuthUsageContext, fetchImpl: PiUsageFe
 	const credits = isRecord(payload.credits) ? payload.credits : undefined;
 	const balance = credits?.has_credits === true ? number(credits.balance) : undefined;
 	if (balance !== undefined) limits.push({ id: "openai-codex:credits", label: "Codex credits", amount: { remaining: balance, unit: "count" }, status: "ok" });
-	if (limits.length === 0) return undefined;
+	if (limits.length === 0) return failedReport("openai-codex", "no recognized usage limits");
 	const tokenIdentity = jwtPayload(auth.accessToken);
 	const accountId = text(payload.account_id) ?? auth.accountId ?? text(tokenIdentity?.account_id);
 	return {
@@ -656,8 +777,10 @@ function kimiMoney(value: unknown): number | undefined {
 async function fetchKimiUsage(context: PiAuthUsageContext, fetchImpl: PiUsageFetch): Promise<SimpleUsageReport | undefined> {
 	const auth = await resolvePiAuth(context, "kimi-coding", { origins: ["https://api.kimi.com"] });
 	if (!auth) return undefined;
-	const payload = await fetchJson(fetchImpl, KIMI_USAGE_URL, bearerHeaders(auth), context.signal);
-	if (!isRecord(payload)) return undefined;
+	const response = await fetchJson(fetchImpl, KIMI_USAGE_URL, bearerHeaders(auth), context.signal);
+	if ("error" in response) return failedReport("kimi-coding", response.error);
+	const payload = response.value;
+	if (!isRecord(payload)) return failedReport("kimi-coding", "invalid usage payload");
 	const limits: SimpleUsageLimit[] = [];
 	const summaryWindow = kimiWindow(undefined, "weekly", "7 Day", isRecord(payload.usage) ? payload.usage.resetTime : undefined);
 	const summary = kimiLimit("kimi-coding:weekly", "Total quota", payload.usage, summaryWindow);
@@ -682,7 +805,7 @@ async function fetchKimiUsage(context: PiAuthUsageContext, fetchImpl: PiUsageFet
 		if (monthlyUsed !== undefined) limits.push({ id: "kimi-coding:wallet:used", label: "Kimi extra used this month", amount: { used: monthlyUsed / 100, unit: currency.toLowerCase() }, status: "ok" });
 		if (monthlyLimit !== undefined) limits.push({ id: "kimi-coding:wallet:limit", label: "Kimi extra monthly limit", amount: { limit: monthlyLimit / 100, unit: currency.toLowerCase() }, status: "ok" });
 	}
-	if (limits.length === 0) return undefined;
+	if (limits.length === 0) return failedReport("kimi-coding", "no recognized usage limits");
 	const tokenIdentity = jwtPayload(auth.accessToken);
 	const accountId = text(payload.accountId) ?? text(payload.userId) ?? text(tokenIdentity?.user_id) ?? text(tokenIdentity?.sub);
 	return { provider: "kimi-coding", fetchedAt: Date.now(), limits, metadata: { authSource: "pi", ...(accountId ? { accountId } : {}) } };
@@ -691,9 +814,11 @@ async function fetchKimiUsage(context: PiAuthUsageContext, fetchImpl: PiUsageFet
 async function fetchOpenRouterUsage(context: PiAuthUsageContext, fetchImpl: PiUsageFetch): Promise<SimpleUsageReport | undefined> {
 	const auth = await resolvePiAuth(context, "openrouter", { origins: ["https://openrouter.ai"] });
 	if (!auth) return undefined;
-	const payload = await fetchJson(fetchImpl, OPENROUTER_KEY_URL, bearerHeaders(auth), context.signal);
+	const response = await fetchJson(fetchImpl, OPENROUTER_KEY_URL, bearerHeaders(auth), context.signal);
+	if ("error" in response) return failedReport("openrouter", response.error);
+	const payload = response.value;
 	const data = isRecord(payload) && isRecord(payload.data) ? payload.data : undefined;
-	if (!data) return undefined;
+	if (!data) return failedReport("openrouter", "invalid usage payload");
 	const limits: SimpleUsageLimit[] = [];
 	const cap = number(data.limit);
 	if (cap !== undefined && cap > 0) {
@@ -706,15 +831,17 @@ async function fetchOpenRouterUsage(context: PiAuthUsageContext, fetchImpl: PiUs
 		const value = number(data[field]);
 		if (value !== undefined) limits.push({ id: `openrouter:usage:${field}`, label, amount: { used: value, unit: "usd" }, status: "ok" });
 	}
-	if (limits.length === 0) return undefined;
+	if (limits.length === 0) return failedReport("openrouter", "no recognized usage limits");
 	return { provider: "openrouter", fetchedAt: Date.now(), limits, metadata: { authSource: "pi", ...(text(data.label) ? { keyLabel: text(data.label) } : {}) } };
 }
 
 async function fetchDeepSeekUsage(context: PiAuthUsageContext, fetchImpl: PiUsageFetch): Promise<SimpleUsageReport | undefined> {
 	const auth = await resolvePiAuth(context, "deepseek", { origins: ["https://api.deepseek.com"] });
 	if (!auth) return undefined;
-	const payload = await fetchJson(fetchImpl, DEEPSEEK_BALANCE_URL, bearerHeaders(auth), context.signal);
-	if (!isRecord(payload) || typeof payload.is_available !== "boolean" || !Array.isArray(payload.balance_infos)) return undefined;
+	const response = await fetchJson(fetchImpl, DEEPSEEK_BALANCE_URL, bearerHeaders(auth), context.signal);
+	if ("error" in response) return failedReport("deepseek", response.error);
+	const payload = response.value;
+	if (!isRecord(payload) || typeof payload.is_available !== "boolean" || !Array.isArray(payload.balance_infos)) return failedReport("deepseek", "invalid usage payload");
 	const limits: SimpleUsageLimit[] = [];
 	for (const item of payload.balance_infos) {
 		if (!isRecord(item) || (item.currency !== "CNY" && item.currency !== "USD")) continue;
@@ -724,16 +851,18 @@ async function fetchDeepSeekUsage(context: PiAuthUsageContext, fetchImpl: PiUsag
 			if (value !== undefined && value >= 0) limits.push({ id: `deepseek:${String(item.currency).toLowerCase()}:${field}`, label: `DeepSeek ${item.currency} ${label}`, amount: { remaining: value, unit }, status: payload.is_available ? "ok" : "warning" });
 		}
 	}
-	if (limits.length === 0) return undefined;
+	if (limits.length === 0) return failedReport("deepseek", "no recognized usage limits");
 	return { provider: "deepseek", fetchedAt: Date.now(), limits, metadata: { authSource: "pi", apiAvailable: payload.is_available } };
 }
 
 async function fetchOpenCodeUsage(context: PiAuthUsageContext, fetchImpl: PiUsageFetch): Promise<SimpleUsageReport | undefined> {
 	const auth = await resolvePiAuth(context, "opencode-go", { origins: ["https://opencode.ai"] });
 	if (!auth) return undefined;
-	const payload = await fetchJson(fetchImpl, OPENCODE_USAGE_URL, bearerHeaders(auth), context.signal);
+	const response = await fetchJson(fetchImpl, OPENCODE_USAGE_URL, bearerHeaders(auth), context.signal);
+	if ("error" in response) return failedReport("opencode-go", response.error);
+	const payload = response.value;
 	const usage = isRecord(payload) && isRecord(payload.usage) ? payload.usage : undefined;
-	if (!usage) return undefined;
+	if (!usage) return failedReport("opencode-go", "invalid usage payload");
 	const limits: SimpleUsageLimit[] = [];
 	for (const [id, label, durationMs] of [["rolling", "OpenCode rolling", 5 * HOUR_MS], ["weekly", "OpenCode weekly", WEEK_MS], ["monthly", "OpenCode monthly", undefined]] as const) {
 		const row = isRecord(usage[id]) ? usage[id] : undefined;
@@ -743,7 +872,7 @@ async function fetchOpenCodeUsage(context: PiAuthUsageContext, fetchImpl: PiUsag
 		const resetsAt = row ? timestamp(row.resetsAt) : undefined;
 		limits.push({ id: `opencode-go:${id}`, label, scope: { windowId: id, shared: true }, window: { id, label, ...(durationMs ? { durationMs } : {}), ...(resetsAt !== undefined ? { resetsAt } : {}) }, amount, status: row?.status === "rate-limited" ? "exhausted" : usageStatus(amount.usedFraction ?? 0) });
 	}
-	if (limits.length === 0) return undefined;
+	if (limits.length === 0) return failedReport("opencode-go", "no recognized usage limits");
 	return { provider: "opencode-go", fetchedAt: Date.now(), limits, metadata: { authSource: "pi" } };
 }
 
@@ -753,19 +882,29 @@ export async function collectPiAuthUsageReports(
 	fetchImpl: PiUsageFetch = fetch,
 	provider?: string,
 ): Promise<SimpleUsageReport[]> {
-	const requested = provider?.toLowerCase() === "xai" ? "xai-oauth" : provider?.toLowerCase();
+	const requested = normalizeUsageProvider(provider);
+	const bridgeRequested = provider?.trim().toLowerCase() === "claude-bridge";
+	const effectiveContext = bridgeRequested ? { ...context, allowClaudeCodeFallback: true } : context;
 	const collectors: Array<[string, () => Promise<SimpleUsageReport | undefined>]> = [
-		["anthropic", () => fetchClaudeUsage(context, fetchImpl)],
-		["cursor", () => fetchCursorUsage(context, fetchImpl)],
-		["deepseek", () => fetchDeepSeekUsage(context, fetchImpl)],
-		["kimi-coding", () => fetchKimiUsage(context, fetchImpl)],
-		["openai-codex", () => fetchCodexUsage(context, fetchImpl)],
-		["openrouter", () => fetchOpenRouterUsage(context, fetchImpl)],
-		["opencode-go", () => fetchOpenCodeUsage(context, fetchImpl)],
-		["xai-oauth", () => fetchXaiUsage(context, fetchImpl)],
+		["anthropic", () => fetchClaudeUsage(effectiveContext, fetchImpl)],
+		["cursor", () => fetchCursorUsage(effectiveContext, fetchImpl)],
+		["deepseek", () => fetchDeepSeekUsage(effectiveContext, fetchImpl)],
+		["kimi-coding", () => fetchKimiUsage(effectiveContext, fetchImpl)],
+		["openai-codex", () => fetchCodexUsage(effectiveContext, fetchImpl)],
+		["openrouter", () => fetchOpenRouterUsage(effectiveContext, fetchImpl)],
+		["opencode-go", () => fetchOpenCodeUsage(effectiveContext, fetchImpl)],
+		["xai-oauth", () => fetchXaiUsage(effectiveContext, fetchImpl)],
 	];
 	const selected = requested ? collectors.filter(([id]) => id === requested) : collectors;
-	const reports = await Promise.all(selected.map(([, collect]) => collect().catch(() => undefined)));
+	const reports = await Promise.all(
+		selected.map(async ([id, collect]) => {
+			try {
+				return await collect();
+			} catch (error) {
+				return failedReport(id, safeUsageError(error));
+			}
+		}),
+	);
 	return reports.filter((report): report is SimpleUsageReport => Boolean(report));
 }
 

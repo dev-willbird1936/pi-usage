@@ -78,6 +78,41 @@ describe("Pi-auth usage collection", () => {
 		expect(requests.filter(request => request.url.includes("grok.com") || request.url.includes("auth.x.ai")).every(request => request.authorization === `Bearer ${accessTokens.xai}`)).toBe(true);
 	});
 
+	test("collects Claude usage through the bridge provider even when its model is hidden", async () => {
+		const requests: Array<{ url: string; authorization?: string }> = [];
+		const reports = await collectPiAuthUsageReports(
+			{
+				readClaudeCodeAccessToken: () => "claude-code-token",
+			},
+			async (input, init) => {
+				const url = String(input);
+				const headers = (init?.headers ?? {}) as Record<string, string>;
+				requests.push({ url, authorization: headers.authorization ?? headers.Authorization });
+				if (url.endsWith("/api/oauth/usage")) {
+					return jsonResponse({
+						five_hour: { utilization: 12, resets_at: "2026-08-21T17:00:00Z" },
+						seven_day: { utilization: 34, resets_at: "2026-08-26T12:00:00Z" },
+						limits: [],
+					});
+				}
+				if (url.endsWith("/api/oauth/profile")) return jsonResponse({ account: { email: "bridge@example.test" } });
+				return new Response("not found", { status: 404 });
+			},
+			"claude-bridge",
+		);
+
+		expect(reports).toHaveLength(1);
+		expect(reports[0]).toMatchObject({
+			provider: "anthropic",
+			metadata: { authSource: "claude-code", email: "bridge@example.test" },
+		});
+		expect(reports[0]?.limits).toEqual(expect.arrayContaining([
+			expect.objectContaining({ id: "anthropic:5h", amount: expect.objectContaining({ used: 12 }) }),
+			expect.objectContaining({ id: "anthropic:7d", amount: expect.objectContaining({ used: 34 }) }),
+		]));
+		expect(requests.every(request => request.authorization === "Bearer claude-code-token")).toBe(true);
+	});
+
 	test("ignores Pi API-key auth for subscription-only usage endpoints", async () => {
 		let requests = 0;
 		const reports = await collectPiAuthUsageReports(
@@ -94,6 +129,71 @@ describe("Pi-auth usage collection", () => {
 		);
 		expect(reports).toEqual([]);
 		expect(requests).toBe(0);
+	});
+
+	test("prefers registry OAuth so Pi can refresh expired stored credentials", async () => {
+		const requests: Array<{ url: string; authorization?: string }> = [];
+		const context: PiAuthUsageContext = {
+			modelRegistry: {
+				getProviderAuth: async provider => provider === "cursor" ? { source: "OAuth", auth: { apiKey: "stale-registry-token" } } : undefined,
+			},
+			readStoredCredential: provider => provider === "cursor" ? { type: "oauth", access: "cursor-token" } : undefined,
+		};
+		const reports = await collectPiAuthUsageReports(context, async (input, init) => {
+			const url = String(input);
+			const headers = (init?.headers ?? {}) as Record<string, string>;
+			requests.push({ url, authorization: headers.Authorization ?? headers.authorization });
+			if (url.includes("DashboardService/GetCurrentPeriodUsage")) {
+				return jsonResponse({
+					billingCycleStart: "2026-08-01T00:00:00Z",
+					billingCycleEnd: "2026-09-01T00:00:00Z",
+					planUsage: { totalPercentUsed: 20, autoPercentUsed: 15, apiPercentUsed: 25, limit: 40000 },
+				});
+			}
+			return new Response("not found", { status: 404 });
+		}, "cursor");
+
+		expect(reports[0]?.provider).toBe("cursor");
+		expect(reports[0]?.limits.map(limit => limit.label)).toEqual(["Cursor included usage", "Cursor Models", "Other Models"]);
+		expect(requests[0]?.authorization).toBe("Bearer stale-registry-token");
+	});
+
+	test("rejects an expired stored OAuth fallback", async () => {
+		const reports = await collectPiAuthUsageReports(
+			{
+				readStoredCredential: provider => provider === "cursor" ? { type: "oauth", access: "expired-token", expires: Date.now() - 1 } : undefined,
+			},
+			async () => jsonResponse({}),
+			"cursor",
+		);
+		expect(reports).toEqual([]);
+	});
+
+	test("reports provider HTTP failures instead of hiding signed-in accounts", async () => {
+		const reports = await collectPiAuthUsageReports(
+			{
+				modelRegistry: {
+					getProviderAuth: async provider => provider === "cursor" ? { source: "OAuth", auth: { apiKey: "cursor-token" } } : undefined,
+				},
+			},
+			async () => new Response("rate limited", { status: 429 }),
+			"cursor",
+		);
+		expect(reports).toHaveLength(1);
+		expect(reports[0]).toMatchObject({ provider: "cursor", error: expect.stringContaining("HTTP 429") });
+	});
+
+	test("does not use Claude Code credentials without an explicit bridge request", async () => {
+		const reports = await collectPiAuthUsageReports(
+			{ readClaudeCodeAccessToken: () => "bridge-token" },
+			async () => jsonResponse({
+				five_hour: { utilization: 10 },
+				seven_day: { utilization: 20 },
+				limits: [],
+			}),
+			"anthropic",
+		);
+		expect(reports).toEqual([]);
 	});
 
 	test("uses Pi credentials for every verified direct collector", async () => {
@@ -130,7 +230,7 @@ describe("Pi-auth usage collection", () => {
 			});
 			if (url.endsWith("/user/balance")) return jsonResponse({ is_available: true, balance_infos: [{ currency: "USD", total_balance: "10.00", granted_balance: "1.00", topped_up_balance: "9.00" }] });
 			if (url.endsWith("/coding/v1/usages")) return jsonResponse({ usage: { used: "10", limit: "100" }, limits: [] });
-			if (url.includes("chatgpt.com/backend-api/wham/usage")) return jsonResponse({ rate_limit: { primary_window: { used_percent: 20 }, secondary_window: { used_percent: 30 } } });
+			if (url.includes("chatgpt.com/backend-api/wham/usage")) return jsonResponse({ rate_limit: { primary_window: { used_percent: 20, limit_window_seconds: 18_000 }, secondary_window: { used_percent: 30, limit_window_seconds: 604_800 } } });
 			if (url.endsWith("/api/v1/key")) return jsonResponse({ data: { limit: 10, limit_remaining: 8 } });
 			if (url.endsWith("/zen/go/v1/usage")) return jsonResponse({ usage: { rolling: { percent: 10 }, weekly: { percent: 20 }, monthly: { percent: 30 } } });
 			if (url.includes("billing?format=credits")) return jsonResponse({ config: { currentPeriod: { start: "2026-08-20T00:00:00Z", end: "2026-08-27T00:00:00Z" }, creditUsagePercent: 35, productUsage: [] } });
@@ -169,6 +269,13 @@ describe("Pi-auth usage collection", () => {
 			authorization: "Bearer codex-token",
 			originator: "pi",
 		});
+		expect(reports.find(report => report.provider === "openai-codex")?.limits.find(limit => limit.window?.durationMs === 604_800_000)).toMatchObject({
+			label: "7 days",
+		});
+		expect(reports.find(report => report.provider === "openrouter")?.limits).toContainEqual(expect.objectContaining({
+			id: "openrouter:key-limit",
+			amount: expect.objectContaining({ used: 2, limit: 10, remaining: 8, unit: "usd" }),
+		}));
 		for (const [host, token] of Object.entries({
 			"api2.cursor.sh": "cursor-token",
 			"api.deepseek.com": "deepseek-token",

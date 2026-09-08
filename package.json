@@ -1,7 +1,7 @@
 {
   "name": "pi-usage-limits",
-  "version": "0.4.0",
-  "description": "Pi extension that renders verified Pi-auth provider usage limits as compact or expanded views.",
+  "version": "0.5.0",
+  "description": "Pi extension that renders verified Pi-auth provider usage limits as compact, expanded, or chat-text views.",
   "author": "dev-willbird1936",
   "license": "MIT",
   "keywords": ["pi-package", "pi-extension", "usage", "quota", "rate-limits"],
@@ -17,6 +17,7 @@
     "extensions": ["./src/extension.ts"]
   },
   "peerDependencies": {
+    "@earendil-works/pi-ai": "*",
     "@earendil-works/pi-coding-agent": "*",
     "@earendil-works/pi-tui": "*"
   },

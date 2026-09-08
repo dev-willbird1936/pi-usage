@@ -113,6 +113,7 @@ describe("simple usage filtering", () => {
 		expect(isHiddenSimpleLimit({ provider: "openai-codex" }, { id: "openai-codex:futuremeter:primary", scope: { tier: "futuremeter" } })).toBe(true);
 		expect(isHiddenSimpleLimit({ provider: "openai-codex" }, { id: "openai-codex:primary" })).toBe(false);
 		expect(isHiddenSimpleLimit({ provider: "openai-codex" }, { id: "openai-codex:secondary" })).toBe(false);
+		expect(isHiddenSimpleLimit({ provider: "openai-codex" }, { id: "openai-codex:credits" })).toBe(false);
 
 		const kept: Array<[string, string]> = [
 			["anthropic", "anthropic:7d"],
@@ -146,6 +147,7 @@ describe("simple usage filtering", () => {
 		expect(isHiddenSimpleLimit({ provider: "kimi-coding", limits: [{ id: "kimi-coding:weekly" }] }, { id: "kimi-coding:detail:300:0" })).toBe(true);
 		expect(isHiddenSimpleLimit({ provider: "kimi-coding" }, { id: "kimi-coding:detail:300:0", window: { durationMs: 5 * 60 * 60 * 1000 } })).toBe(true);
 		expect(isHiddenSimpleLimit({ provider: "kimi-coding" }, { id: "kimi-coding:wallet:used" })).toBe(true);
+		expect(isHiddenSimpleLimit({ provider: "kimi-coding" }, { id: "kimi-coding:wallet:balance" })).toBe(false);
 	});
 
 	test("drops Cursor aggregate rows only when itemized meters exist", () => {
@@ -164,6 +166,26 @@ describe("simple usage filtering", () => {
 			limits: [{ id: "cursor:usd:individual-overall", label: "Personal Usage" }],
 		};
 		expect(formatSimpleUsage([aggregateOnly])).toContain("Personal Usage");
+
+		const planAndOnDemand: SimpleUsageReport = {
+			provider: "cursor",
+			limits: [
+				{ id: "cursor:plan", label: "Cursor included usage", amount: { used: 90, limit: 100, unit: "percent" } },
+				{ id: "cursor:on-demand", label: "Cursor on-demand", amount: { used: 1, limit: 10, unit: "usd" } },
+			],
+		};
+		const combined = formatSimpleUsage([planAndOnDemand]);
+		expect(combined).toContain("Cursor included usage");
+		expect(combined).toContain("Cursor on-demand");
+	});
+
+	test("renders limit-only amounts and provider failures", () => {
+		const output = formatSimpleUsage([
+			{ provider: "kimi-coding", limits: [{ label: "Monthly cap", amount: { limit: 50, unit: "usd" } }] },
+			{ provider: "cursor", error: "Usage unavailable: HTTP 429" },
+		], now);
+		expect(output).toContain("$50 limit");
+		expect(output).toContain("Usage unavailable: HTTP 429");
 	});
 
 	test("labels every supported provider", () => {
@@ -183,7 +205,7 @@ describe("simple usage filtering", () => {
 	test("keeps account labels and reset countdowns", () => {
 		const output = formatSimpleUsage(fixture, now);
 
-		expect(output).toContain("Codex — codex@example.test");
+		expect(output).toContain("Codex · codex@example.test");
 		expect(output).toContain("resets in 5d");
 	});
 
@@ -211,19 +233,19 @@ describe("simple usage filtering", () => {
 		expect(slowBurn).toEqual({ milliseconds: 18 * 24 * 60 * 60 * 1000 });
 
 		const plain = formatSimpleUsage([{ provider: "openai-codex", limits: [limit] }], now);
-		expect(plain).toContain("REMAINING: ~2d");
+		expect(plain).toContain("runs out in ~2d");
 		const styled = formatSimpleUsageStyled(
 			[{ provider: "openai-codex", limits: [limit] }],
 			{ bold: text => text, fg: (_color, text) => text },
 			100,
 			now,
 		);
-		expect(styled).toContain("REMAINING: ~2d");
+		expect(styled).toContain("runs out in ~2d");
 	});
 
 	test("adds simple-view totals for percentages and quantities", () => {
 		const plain = formatSimpleUsage(fixture, now);
-		expect(plain).toContain("Total usage\n  69% used · 31% left · 2 quotas");
+		expect(plain).toContain("Total usage\n   69% used · 31% left · 2 quotas");
 
 		const styled = formatSimpleUsageStyled(
 			fixture,
@@ -239,6 +261,22 @@ describe("simple usage filtering", () => {
 			now,
 		);
 		expect(money).toContain("$2 / $10 · 20% used · $8 left · 1 quota");
+		const moneyStyled = formatSimpleUsageStyled(
+			[{ provider: "openrouter", limits: [{ id: "openrouter:key-limit", label: "OpenRouter key limit", amount: { used: 0.03, limit: 60, unit: "usd" } }] }],
+			{ bold: text => text, fg: (_color, text) => text },
+			100,
+			now,
+		);
+		expect(moneyStyled).toContain("$0.03 / $60 · 0.05% used");
+		expect(moneyStyled).toContain("$59.97 left");
+
+		const balance = formatSimpleUsageStyled(
+			[{ provider: "deepseek", limits: [{ id: "deepseek:usd:total", label: "DeepSeek USD total", amount: { remaining: 2.48, unit: "usd" } }] }],
+			{ bold: text => text, fg: (_color, text) => text },
+			100,
+			now,
+		);
+		expect(balance).toContain("$2.48 left");
 
 		const full = formatSimpleUsage(fixture, now, { title: "Usage", hideFilteredLimits: false });
 		expect(full).not.toContain("Total usage");

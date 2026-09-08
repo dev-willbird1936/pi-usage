@@ -1,5 +1,14 @@
 # Changelog
 
+## [0.5.0] - 2026-08-31
+
+- Redesigned the usage layout: one row per quota with globally aligned label, bar, and remaining-value columns, a dim detail line underneath, and a rule-separated header and totals block.
+- The account identity now sits in the provider heading instead of a placeholder `account N` row; it only repeats per row when a provider really has several accounts.
+- Plain and themed output now share one renderer, so chat clients and LLM context see the same bars and alignment the TUI does.
+- Added a `usage` tool so the report reaches non-terminal hosts (AionUi, ACP, RPC) through the normal agent-chat path; slash commands emit a Pi custom message, which only the TUI renders. Takes optional `view` (`compact`/`expanded`) and `provider`.
+- Added `/usage chat` (and the `--chat` flag) to emit the report as a fenced plain-text chat message for clients that do render custom-message content.
+- Renamed the view titles to `Usage · compact`, `Usage · current`, and `Usage · expanded`, and the burn-rate forecast from `REMAINING: ~…` to `runs out in ~…`.
+
 ## [0.4.0] - 2026-08-29
 
 - Bare `/usage` is now the default compact programming-quota view; `/usage current` expands the active provider and `/usage expanded` expands every verified direct provider.
