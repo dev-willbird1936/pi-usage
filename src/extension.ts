@@ -18,6 +18,8 @@ import {
 	USAGE_PROVIDER_IDS,
 	isPiAuthUsageProvider,
 	readClaudeCodeAccessToken,
+	readClaudeCodeCredential,
+	writeClaudeCodeCredential,
 	redactPiAuthUsageReports,
 } from "./pi-auth-usage.ts";
 import { getUsageArgumentCompletions } from "./autocomplete.ts";
@@ -147,10 +149,9 @@ async function collectUsage(
 	ctx: UsageAuthContext,
 	provider: string | undefined,
 	redact: boolean,
-	allowClaudeCodeFallback = false,
 ): Promise<SimpleUsageReport[]> {
 	const reports = await collectPiAuthUsageReports(
-		{ ...ctx, readStoredCredential, readClaudeCodeAccessToken, allowClaudeCodeFallback },
+		{ ...ctx, readStoredCredential, readClaudeCodeAccessToken, readClaudeCodeCredential, writeClaudeCodeCredential },
 		fetch,
 		provider,
 	);
@@ -185,7 +186,7 @@ const usageTool = defineTool({
 			throw new Error(`No direct usage collector for ${params.provider}; supported providers: ${USAGE_PROVIDER_IDS.join(", ")}`);
 		}
 		const expanded = params.view === "expanded";
-		const reports = await collectUsage(ctx, provider, false, params.provider?.trim().toLowerCase() === "claude-bridge");
+		const reports = await collectUsage(ctx, provider, false);
 		const text = formatSimpleUsage(reports, Date.now(), {
 			title: expanded ? "Usage · expanded" : "Usage · compact",
 			hideFilteredLimits: !expanded,
@@ -239,8 +240,7 @@ export default function usageExtension(pi: ExtensionAPI): void {
 					throw new Error(`No direct usage collector for ${piProvider}; supported providers: ${USAGE_PROVIDER_IDS.join(", ")}`);
 				}
 
-				const bridgeRequested = (provider ?? (view === "current" ? ctx.model?.provider : undefined))?.trim().toLowerCase() === "claude-bridge";
-				const reports = await collectUsage(ctx, piProvider, hasArgument(forwardedArgs, "--redact"), bridgeRequested);
+				const reports = await collectUsage(ctx, piProvider, hasArgument(forwardedArgs, "--redact"));
 				const viewOptions = { title: usageTitle(view), hideFilteredLimits: view === "simple" };
 				// JSON and chat carry their own literal payload, so they omit `reports`
 				// and the renderer prints the content verbatim in every client.

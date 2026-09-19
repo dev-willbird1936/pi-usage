@@ -2,7 +2,7 @@
 
 A Pi extension by dev-willbird1936 that renders provider usage limits as clean, theme-aware views.
 
-Live usage resolves direct-provider credentials through `ctx.modelRegistry` and Pi's official stored-credential API. When Claude models are supplied by `claude-bridge`, it reads Claude Code's existing OAuth credential as a narrow fallback. The extension has no external usage collector or OMP dependency; it reports only verified provider usage.
+Live usage resolves direct-provider credentials through `ctx.modelRegistry` and Pi's official stored-credential API. Claude subscription quotas use the Claude Code CLI login; Pi `/login anthropic` is a different OAuth client and is only used if that login is missing or rejected. The extension has no external usage collector or OMP dependency; it reports only verified provider usage.
 
 Commands:
 
@@ -38,8 +38,7 @@ Usage · compact                                               updated 1m ago
 ─────────────────────────────────────────────────────────────────────────
 
 OpenRouter
- ✓ OpenRouter key limit      ░░░░░░░░░░░░░░░░░░░░░░░░  $59.97 left
-   $0.03 / $60 · 0.06% used
+ ✓ OpenRouter credits        ·······················   $12.40 left
 
 Claude · you@example.com
  ✓ Claude 7 Day              ██████████▓░░░░░░░░░░░░░     55% free
@@ -54,12 +53,12 @@ Cursor
 ─────────────────────────────────────────────────────────────────────────
 Total usage
    20.8% used · 79.2% left · 4 quotas
-   $400.03 / $460 · 87% used · $59.97 left · 2 quotas
+   $400 / $400 · 100% used · $0 left · 1 quota
 ```
 
 ## Supported providers
 
-The verified direct collectors support Anthropic (Claude), Cursor, DeepSeek, Kimi Coding, OpenAI Codex, OpenRouter, OpenCode Go, and xAI (Grok). Claude's `claude-bridge` provider is also accepted as an alias, so hiding Claude models in `/models` does not hide Claude usage from `/usage`; when no Pi Anthropic OAuth credential is available, the bridge uses Claude Code's own OAuth credential. `/usage expanded` and `/usage extended` show every reported limit; tab-completion after `/usage --provider` lists these providers. Direct providers resolve credentials from Pi's model registry or Pi's official stored-credential API. Providers without a verified usage endpoint or credential are not shown.
+The verified direct collectors support Anthropic (Claude), Cursor, DeepSeek, Kimi Coding, OpenAI Codex, OpenRouter, OpenCode Go, and xAI (Grok). Claude usage is the Claude Code / Claude Bridge subscription (Max/Pro), not Pi's console Anthropic OAuth. `claude-bridge` is accepted as an alias so hiding Claude models in `/models` does not hide Claude usage from `/usage`. `/usage expanded` and `/usage extended` show every reported limit; tab-completion after `/usage --provider` lists these providers. Direct providers resolve credentials from Pi's model registry or Pi's official stored-credential API. Providers without a verified usage endpoint or credential are not shown.
 
 ## What bare `/usage` shows
 
@@ -68,13 +67,24 @@ Bare `/usage` is a live programming-quota snapshot. It keeps each provider's mai
 - **Claude** — the account 7-day quota plus Extra Usage; 5-hour and model-tier rows are expanded-only.
 - **Cursor** — the main `Cursor Models` and `Other Models` meters; aggregate detail is expanded-only.
 - **Codex** — the longer primary/secondary programming windows plus available Codex credits; short windows and Spark/feature meters are expanded-only.
-- **Kimi** — the main weekly quota plus available extra balance; short/detail windows and balance accounting components are expanded-only.
-- **OpenRouter** — the key spending limit; daily/weekly/monthly usage analytics are expanded-only.
+- **Kimi** — the main weekly quota plus available extra balance; expired or exhausted coding plans are omitted; short/detail windows and balance accounting components are expanded-only.
+- **OpenRouter** — remaining account credits, like DeepSeek; the key spending cap and daily/weekly/monthly usage analytics are expanded-only.
 - **DeepSeek** — total balance; granted and topped-up components are expanded-only.
 - **OpenCode Go** — the weekly quota; rolling and monthly rows are expanded-only.
 - **Grok (xAI)** — overall credits, monthly included usage, and on-demand balance; per-product splits are expanded-only.
 
 GitHub Copilot and Z.ai are intentionally not listed until Pi's signed-in credential and a stable usage endpoint can be verified for them.
+
+## Credentials
+
+This extension does not ship API keys. Live usage reads credentials from Pi's model registry and Pi's stored-credential API.
+
+Claude Max/Pro quotas use the Claude Code CLI login file:
+
+- `$CLAUDE_CONFIG_DIR/.credentials.json` when `CLAUDE_CONFIG_DIR` is set
+- `~/.claude/.credentials.json` otherwise
+
+A successful OAuth refresh writes the new access token (and rotated refresh token, if any) back to that same file. Do not copy that file into this repository.
 
 ## Install
 

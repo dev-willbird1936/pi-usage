@@ -144,6 +144,9 @@ describe("simple usage filtering", () => {
 		expect(isHiddenSimpleLimit({ provider: "opencode-go" }, { id: "opencode-go:monthly" })).toBe(true);
 		expect(isHiddenSimpleLimit({ provider: "deepseek" }, { id: "deepseek:usd:granted_balance" })).toBe(true);
 		expect(isHiddenSimpleLimit({ provider: "openrouter" }, { id: "openrouter:usage:monthly" })).toBe(true);
+		expect(isHiddenSimpleLimit({ provider: "openrouter" }, { id: "openrouter:credits" })).toBe(false);
+		expect(isHiddenSimpleLimit({ provider: "openrouter" }, { id: "openrouter:key-limit" })).toBe(false);
+		expect(isHiddenSimpleLimit({ provider: "openrouter", limits: [{ id: "openrouter:credits" }] }, { id: "openrouter:key-limit" })).toBe(true);
 		expect(isHiddenSimpleLimit({ provider: "kimi-coding", limits: [{ id: "kimi-coding:weekly" }] }, { id: "kimi-coding:detail:300:0" })).toBe(true);
 		expect(isHiddenSimpleLimit({ provider: "kimi-coding" }, { id: "kimi-coding:detail:300:0", window: { durationMs: 5 * 60 * 60 * 1000 } })).toBe(true);
 		expect(isHiddenSimpleLimit({ provider: "kimi-coding" }, { id: "kimi-coding:wallet:used" })).toBe(true);
@@ -269,6 +272,22 @@ describe("simple usage filtering", () => {
 		);
 		expect(moneyStyled).toContain("$0.03 / $60 · 0.05% used");
 		expect(moneyStyled).toContain("$59.97 left");
+
+		const openRouterCredits = formatSimpleUsageStyled(
+			[{
+				provider: "openrouter",
+				limits: [
+					{ id: "openrouter:credits", label: "OpenRouter credits", amount: { remaining: 12.4, unit: "usd" } },
+					{ id: "openrouter:key-limit", label: "OpenRouter key limit", amount: { used: 0, limit: 60, unit: "usd" } },
+				],
+			}],
+			{ bold: text => text, fg: (_color, text) => text },
+			100,
+			now,
+		);
+		expect(openRouterCredits).toContain("$12.4 left");
+		expect(openRouterCredits).not.toContain("OpenRouter key limit");
+		expect(openRouterCredits).not.toContain("$60 left");
 
 		const balance = formatSimpleUsageStyled(
 			[{ provider: "deepseek", limits: [{ id: "deepseek:usd:total", label: "DeepSeek USD total", amount: { remaining: 2.48, unit: "usd" } }] }],

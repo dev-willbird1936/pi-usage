@@ -1,11 +1,14 @@
 {
   "name": "pi-usage-limits",
-  "version": "0.5.0",
+  "version": "0.5.3",
   "description": "Pi extension that renders verified Pi-auth provider usage limits as compact, expanded, or chat-text views.",
   "author": "dev-willbird1936",
   "license": "MIT",
   "keywords": ["pi-package", "pi-extension", "usage", "quota", "rate-limits"],
   "type": "module",
+  "engines": {
+    "node": ">=22.19.0"
+  },
   "repository": {
     "type": "git",
     "url": "https://github.com/dev-willbird1936/pi-usage.git"
@@ -21,7 +24,13 @@
     "@earendil-works/pi-coding-agent": "*",
     "@earendil-works/pi-tui": "*"
   },
+  "devDependencies": {
+    "@types/node": "^22.19.0",
+    "typescript": "^5.9.0"
+  },
   "scripts": {
-    "test": "bun test"
+    "test": "bun test",
+    "typecheck": "tsc --noEmit",
+    "check": "npm run typecheck && npm test"
   }
 }

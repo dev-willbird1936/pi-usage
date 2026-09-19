@@ -143,7 +143,9 @@ export function isHiddenSimpleLimit(report: SimpleUsageReport, limit: SimpleUsag
 	if (provider === "kimi-coding" && id.startsWith("kimi-coding:wallet:") && id !== "kimi-coding:wallet:balance") return true;
 
 	// OpenRouter's usage_* fields are spend analytics, not a remaining quota.
+	// The key spending cap is expanded-only when account credits are present.
 	if (provider === "openrouter" && id.startsWith("openrouter:usage:")) return true;
+	if (provider === "openrouter" && id === "openrouter:key-limit" && (report.limits ?? []).some(item => item.id === "openrouter:credits")) return true;
 
 	// DeepSeek's granted/topped-up balances are components of total balance.
 	if (provider === "deepseek" && (id.includes(":granted_balance") || id.includes(":topped_up_balance"))) return true;

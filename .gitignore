@@ -1,5 +1,9 @@
 node_modules/
 .pi/
+.serena/
 *.log
 .tmp-*
 .DS_Store
+.env
+.env.*
+!.env.example

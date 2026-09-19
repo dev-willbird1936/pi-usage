@@ -1,5 +1,19 @@
 # Changelog
 
+## [0.5.3] - 2026-09-19
+
+- Persist a refreshed Claude Code login by replacing `~/.claude/.credentials.json` (or `$CLAUDE_CONFIG_DIR/.credentials.json`) even when that file already exists, as on Windows.
+
+## [0.5.2] - 2026-09-09
+
+- Compact `/usage` now reads the Claude Code CLI login for Claude Max / Pro quotas. Pi `/login anthropic` is a different OAuth client and is only tried if the Claude Code token is missing or rejected.
+
+## [0.5.1] - 2026-09-08
+
+- OpenRouter compact view now shows remaining account credits instead of the unused key spending cap.
+- Cursor usage prefers a Cursor session JWT over a CLIProxy API key, so `/usage` no longer reports HTTP 401 from `api2.cursor.sh`.
+- Kimi is omitted when the coding plan returns HTTP 429/402 (insufficient balance).
+
 ## [0.5.0] - 2026-08-31
 
 - Redesigned the usage layout: one row per quota with globally aligned label, bar, and remaining-value columns, a dim detail line underneath, and a rule-separated header and totals block.

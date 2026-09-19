@@ -1,5 +1,5 @@
 import { Buffer } from "node:buffer";
-import { readFileSync } from "node:fs";
+import { copyFileSync, readFileSync, renameSync, unlinkSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import type { SimpleUsageAmount, SimpleUsageLimit, SimpleUsageReport, SimpleUsageWindow } from "./simple-usage.ts";
@@ -12,9 +12,12 @@ export interface PiAuthUsageContext {
 		expires?: unknown;
 		expiresAt?: unknown;
 	} | undefined;
-	/** Read Claude Code's OAuth token only when the claude-bridge provider is requested. */
+	/** Read Claude Code's OAuth token for Claude subscription usage. */
 	readClaudeCodeAccessToken?: () => string | undefined;
-	allowClaudeCodeFallback?: boolean;
+	/** Read the full Claude Code OAuth credential so expired access tokens can refresh. */
+	readClaudeCodeCredential?: () => ClaudeCodeCredential | undefined;
+	/** Persist a refreshed Claude Code OAuth credential. */
+	writeClaudeCodeCredential?: (updates: ClaudeCodeCredentialUpdate) => void;
 	modelRegistry?: {
 		getProviderAuth(provider: string): Promise<
 			| {
@@ -35,6 +38,17 @@ export interface PiAuthUsageContext {
 export type PiUsageFetch = typeof fetch;
 
 type PiAuth = { accessToken: string; accountId?: string };
+export type ClaudeCodeCredential = {
+	accessToken?: string;
+	refreshToken?: string;
+	expiresAt?: number;
+	refreshTokenExpiresAt?: number;
+};
+export type ClaudeCodeCredentialUpdate = {
+	accessToken: string;
+	refreshToken?: string;
+	expiresAt?: number;
+};
 type PercentBucket = { utilization?: number; resetsAt?: number };
 
 const HOUR_MS = 60 * 60 * 1000;
@@ -43,6 +57,8 @@ const WEEK_MS = 7 * DAY_MS;
 const REQUEST_TIMEOUT_MS = 20_000;
 const CLAUDE_USAGE_URL = "https://api.anthropic.com/api/oauth/usage";
 const CLAUDE_PROFILE_URL = "https://api.anthropic.com/api/oauth/profile";
+const CLAUDE_OAUTH_TOKEN_URL = "https://platform.claude.com/v1/oauth/token";
+const CLAUDE_CODE_CLIENT_ID = "9d1c250a-e61b-44d9-88ed-5944d1962f5e";
 const XAI_BILLING_URL = "https://cli-chat-proxy.grok.com/v1/billing?format=credits";
 const XAI_MONTHLY_BILLING_URL = "https://cli-chat-proxy.grok.com/v1/billing";
 const XAI_USERINFO_URL = "https://auth.x.ai/oauth2/userinfo";
@@ -50,6 +66,7 @@ const CURSOR_USAGE_URL = "https://api2.cursor.sh/aiserver.v1.DashboardService/Ge
 const CODEX_USAGE_URL = "https://chatgpt.com/backend-api/wham/usage";
 const KIMI_USAGE_URL = "https://api.kimi.com/coding/v1/usages";
 const OPENROUTER_KEY_URL = "https://openrouter.ai/api/v1/key";
+const OPENROUTER_CREDITS_URL = "https://openrouter.ai/api/v1/credits";
 const DEEPSEEK_BALANCE_URL = "https://api.deepseek.com/user/balance";
 const OPENCODE_USAGE_URL = "https://opencode.ai/zen/go/v1/usage";
 
@@ -102,19 +119,60 @@ function text(value: unknown): string | undefined {
 	return typeof value === "string" && value.trim() ? value.trim() : undefined;
 }
 
-/**
- * Read the OAuth token used by Claude Code's bridge provider. It is used only
- * as a fallback when a Pi Anthropic credential is unavailable.
- */
-export function readClaudeCodeAccessToken(): string | undefined {
+/** Claude Code CLI login file: `$CLAUDE_CONFIG_DIR/.credentials.json` or `~/.claude/.credentials.json`. */
+function claudeCodeCredentialsPath(): string {
+	const configuredDir = typeof process !== "undefined" ? process.env.CLAUDE_CONFIG_DIR?.trim() : undefined;
+	return join(configuredDir || join(homedir(), ".claude"), ".credentials.json");
+}
+
+/** Read Claude Code's subscription OAuth credential from the Claude Code CLI file. */
+export function readClaudeCodeCredential(): ClaudeCodeCredential | undefined {
 	try {
-		const configuredDir = typeof process !== "undefined" ? process.env.CLAUDE_CONFIG_DIR?.trim() : undefined;
-		const credentialsPath = join(configuredDir || join(homedir(), ".claude"), ".credentials.json");
-		const payload = JSON.parse(readFileSync(credentialsPath, "utf8")) as unknown;
-		if (!isRecord(payload) || !isRecord(payload.claudeAiOauth)) return undefined;
-		return text(payload.claudeAiOauth.accessToken);
+		const payload = JSON.parse(readFileSync(claudeCodeCredentialsPath(), "utf8")) as unknown;
+		const oauth = isRecord(payload) && isRecord(payload.claudeAiOauth) ? payload.claudeAiOauth : undefined;
+		const accessToken = text(oauth?.accessToken);
+		if (!accessToken) return undefined;
+		const refreshToken = text(oauth?.refreshToken);
+		const expiresAt = timestamp(oauth?.expiresAt);
+		const refreshTokenExpiresAt = timestamp(oauth?.refreshTokenExpiresAt);
+		return {
+			accessToken,
+			...(refreshToken ? { refreshToken } : {}),
+			...(expiresAt !== undefined ? { expiresAt } : {}),
+			...(refreshTokenExpiresAt !== undefined ? { refreshTokenExpiresAt } : {}),
+		};
 	} catch {
 		return undefined;
+	}
+}
+
+/** Read the OAuth token used by Claude Code (and Claude Bridge). */
+export function readClaudeCodeAccessToken(): string | undefined {
+	return readClaudeCodeCredential()?.accessToken;
+}
+
+/** Update only Claude Code's OAuth fields, preserving the rest of the file. */
+export function writeClaudeCodeCredential(updates: ClaudeCodeCredentialUpdate): void {
+	const credentialsPath = claudeCodeCredentialsPath();
+	const payload = JSON.parse(readFileSync(credentialsPath, "utf8")) as unknown;
+	if (!isRecord(payload) || !isRecord(payload.claudeAiOauth)) throw new Error("Claude Code credential file has an invalid shape");
+	payload.claudeAiOauth = {
+		...payload.claudeAiOauth,
+		accessToken: updates.accessToken,
+		...(updates.refreshToken ? { refreshToken: updates.refreshToken } : {}),
+		...(updates.expiresAt !== undefined ? { expiresAt: updates.expiresAt } : {}),
+	};
+	const temporaryPath = `${credentialsPath}.${process.pid}.${Date.now()}.tmp`;
+	writeFileSync(temporaryPath, `${JSON.stringify(payload, null, 2)}\n`, { encoding: "utf8", mode: 0o600 });
+	try {
+		try {
+			renameSync(temporaryPath, credentialsPath);
+		} catch {
+			// Windows cannot rename over an existing file; copy then remove the temp.
+			copyFileSync(temporaryPath, credentialsPath);
+		}
+	} finally {
+		try { unlinkSync(temporaryPath); } catch { /* already replaced */ }
 	}
 }
 
@@ -175,7 +233,7 @@ function requestSignal(signal?: AbortSignal): AbortSignal {
 	return signal ? AbortSignal.any([signal, timeout]) : timeout;
 }
 
-type JsonFetchResult = { value: unknown } | { error: string };
+type JsonFetchResult = { value: unknown } | { error: string; status?: number; body?: unknown };
 
 function safeUsageError(error: unknown): string {
 	const message = error instanceof Error ? error.message : String(error);
@@ -206,7 +264,15 @@ async function fetchJson(
 			redirect: "error",
 			signal: requestSignal(signal),
 		});
-		if (!response.ok) return { error: `HTTP ${response.status}` };
+		if (!response.ok) {
+			let body: unknown;
+			try {
+				body = await response.json();
+			} catch {
+				body = undefined;
+			}
+			return { error: `HTTP ${response.status}`, status: response.status, ...(body !== undefined ? { body } : {}) };
+		}
 		try {
 			return { value: await response.json() };
 		} catch {
@@ -215,6 +281,41 @@ async function fetchJson(
 	} catch (error) {
 		return { error: safeUsageError(error) };
 	}
+}
+
+async function refreshClaudeCodeAuth(
+	context: PiAuthUsageContext,
+	fetchImpl: PiUsageFetch,
+	credential: ClaudeCodeCredential,
+): Promise<PiAuth | undefined> {
+	const refreshToken = text(credential.refreshToken);
+	if (!refreshToken) return undefined;
+	const response = await fetchJson(
+		fetchImpl,
+		CLAUDE_OAUTH_TOKEN_URL,
+		{ Accept: "application/json", "Content-Type": "application/json" },
+		context.signal,
+		{
+			method: "POST",
+			body: JSON.stringify({ grant_type: "refresh_token", refresh_token: refreshToken, client_id: CLAUDE_CODE_CLIENT_ID }),
+		},
+	);
+	if ("error" in response || !isRecord(response.value)) return undefined;
+	const accessToken = text(response.value.access_token);
+	if (!accessToken) return undefined;
+	const rotatedRefreshToken = text(response.value.refresh_token);
+	const expiresIn = number(response.value.expires_in);
+	const updates: ClaudeCodeCredentialUpdate = {
+		accessToken,
+		...(rotatedRefreshToken ? { refreshToken: rotatedRefreshToken } : {}),
+		...(expiresIn !== undefined && expiresIn > 0 ? { expiresAt: Date.now() + expiresIn * 1000 } : {}),
+	};
+	try {
+		context.writeClaudeCodeCredential?.(updates);
+	} catch {
+		// A refreshed token still works for this request even if persistence fails.
+	}
+	return { accessToken };
 }
 
 function headerValue(headers: Record<string, unknown> | undefined, name: string): string | undefined {
@@ -261,8 +362,10 @@ async function resolvePiAuth(
 		}
 	}
 
-	// Stored credentials are a compatibility fallback when registry resolution is unavailable.
-	// Do not use an expired snapshot; normal OAuth refresh belongs to Pi's registry.
+	return storedOAuthAuth(context, provider);
+}
+
+function storedOAuthAuth(context: PiAuthUsageContext, provider: string): PiAuth | undefined {
 	try {
 		const stored = context.readStoredCredential?.(provider);
 		const expiry = timestamp(stored?.expiresAt ?? stored?.expires);
@@ -274,6 +377,22 @@ async function resolvePiAuth(
 		// No usable stored credential.
 	}
 	return undefined;
+}
+
+function isCursorJwt(token: string): boolean {
+	const payload = jwtPayload(token);
+	if (!payload) return false;
+	const iss = (text(payload.iss) ?? "").toLowerCase();
+	const aud = (text(payload.aud) ?? "").toLowerCase();
+	return iss.includes("cursor.") || aud.includes("cursor.");
+}
+
+function uniqueAuths(auths: Array<PiAuth | undefined>): PiAuth[] {
+	const out: PiAuth[] = [];
+	for (const auth of auths) {
+		if (auth && !out.some(existing => existing.accessToken === auth.accessToken)) out.push(auth);
+	}
+	return out;
 }
 
 function bearerHeaders(auth: PiAuth): Record<string, string> {
@@ -383,40 +502,77 @@ function claudeExtraLimit(payload: Record<string, unknown>): SimpleUsageLimit | 
 		: undefined;
 }
 
+function claudeCodeAuth(context: PiAuthUsageContext): PiAuth | undefined {
+	try {
+		const accessToken = text(context.readClaudeCodeAccessToken?.());
+		return accessToken ? { accessToken } : undefined;
+	} catch {
+		return undefined;
+	}
+}
+
 async function fetchClaudeUsage(
 	context: PiAuthUsageContext,
 	fetchImpl: PiUsageFetch,
 ): Promise<SimpleUsageReport | undefined> {
-	const auth = await resolvePiAuth(context, "anthropic", { oauthOnly: true, origins: ["https://api.anthropic.com"] });
-	let accessToken = auth?.accessToken;
-	let authSource = "pi";
-	if (!accessToken && context.allowClaudeCodeFallback === true) {
-		try {
-			accessToken = text(context.readClaudeCodeAccessToken?.());
-		} catch {
-			accessToken = undefined;
+	const piAuth = await resolvePiAuth(context, "anthropic", { oauthOnly: true, origins: ["https://api.anthropic.com"] });
+	const claudeCredential = context.readClaudeCodeCredential?.();
+	const candidates: Array<PiAuth & { source: "claude-code" | "pi" }> = [];
+	const addCandidate = (auth: PiAuth | undefined, source: "claude-code" | "pi"): void => {
+		if (auth && !candidates.some(existing => existing.accessToken === auth.accessToken)) {
+			candidates.push({ ...auth, source });
 		}
-		if (accessToken) authSource = "claude-code";
+	};
+	let refreshedClaudeCode = false;
+	let claudeAuth = claudeCodeAuth(context);
+	if (claudeCredential?.accessToken) claudeAuth = { accessToken: claudeCredential.accessToken };
+	if (
+		claudeCredential?.expiresAt !== undefined &&
+		claudeCredential.expiresAt <= Date.now() + 30_000
+	) {
+		const refreshed = await refreshClaudeCodeAuth(context, fetchImpl, claudeCredential);
+		if (refreshed) {
+			claudeAuth = refreshed;
+			refreshedClaudeCode = true;
+		}
 	}
-	if (!accessToken) return undefined;
-	const headers = {
+	addCandidate(claudeAuth, "claude-code");
+	addCandidate(piAuth, "pi");
+	if (candidates.length === 0) return undefined;
+
+	const headersFor = (accessToken: string): Record<string, string> => ({
 		accept: "application/json, text/plain, */*",
+		"content-type": "application/json",
 		"anthropic-beta":
 			"claude-code-20250219,oauth-2025-04-20,interleaved-thinking-2025-05-14,redact-thinking-2026-02-12,context-management-2025-06-27,prompt-caching-scope-2026-01-05,mid-conversation-system-2026-04-07,advanced-tool-use-2025-11-20,effort-2025-11-24,extended-cache-ttl-2025-04-11",
 		"user-agent": "claude-cli/2.1.220 (external, cli)",
 		authorization: `Bearer ${accessToken}`,
-	};
-	const [usageResponse, profileResponse] = await Promise.all([
-		fetchJson(fetchImpl, CLAUDE_USAGE_URL, headers, context.signal),
-		fetchJson(fetchImpl, CLAUDE_PROFILE_URL, headers, context.signal),
-	]);
-	if ("error" in usageResponse) return failedReport("anthropic", usageResponse.error);
-	const usagePayload = usageResponse.value;
-	if (!isRecord(usagePayload)) return failedReport("anthropic", "invalid usage payload");
-	const profilePayload = "value" in profileResponse ? profileResponse.value : undefined;
-	const notes = "error" in profileResponse ? [`Profile unavailable: ${profileResponse.error}`] : undefined;
+	});
 
-	const entries = Array.isArray(usagePayload.limits)
+	let lastError: string | undefined;
+	for (let index = 0; index < candidates.length; index++) {
+		const auth = candidates[index];
+		const [usageResponse, profileResponse] = await Promise.all([
+			fetchJson(fetchImpl, CLAUDE_USAGE_URL, headersFor(auth.accessToken), context.signal),
+			fetchJson(fetchImpl, CLAUDE_PROFILE_URL, headersFor(auth.accessToken), context.signal),
+		]);
+		if ("error" in usageResponse) {
+			lastError = usageResponse.error;
+			if ((usageResponse.status === 401 || usageResponse.status === 403) && auth.source === "claude-code" && !refreshedClaudeCode && claudeCredential) {
+				const refreshed = await refreshClaudeCodeAuth(context, fetchImpl, claudeCredential);
+				refreshedClaudeCode = true;
+				if (refreshed) candidates.splice(index + 1, 0, { ...refreshed, source: "claude-code" });
+			}
+			if (usageResponse.status === 401 || usageResponse.status === 403) continue;
+			return failedReport("anthropic", usageResponse.error);
+		}
+		const usagePayload = usageResponse.value;
+		if (!isRecord(usagePayload)) return failedReport("anthropic", "invalid usage payload");
+		const profilePayload = "value" in profileResponse ? profileResponse.value : undefined;
+		const notes = "error" in profileResponse ? [`Profile unavailable: ${profileResponse.error}`] : undefined;
+		const authSource = auth.source;
+
+		const entries = Array.isArray(usagePayload.limits)
 		? usagePayload.limits
 				.map((entry, index) => (isRecord(entry) ? claudeLimitFromEntry(entry, index) : undefined))
 				.filter((entry): entry is NonNullable<typeof entry> => Boolean(entry))
@@ -477,6 +633,8 @@ async function fetchClaudeUsage(
 			...(identity.orgName ? { orgName: identity.orgName } : {}),
 		},
 	};
+	}
+	return lastError ? failedReport("anthropic", lastError) : undefined;
 }
 
 function jwtPayload(token: string): Record<string, unknown> | undefined {
@@ -541,8 +699,7 @@ async function fetchXaiUsage(context: PiAuthUsageContext, fetchImpl: PiUsageFetc
 		weeklyPercent !== undefined &&
 		weeklyPercent >= 0 &&
 		weeklyPercent <= 100 &&
-		weeklyConfig &&
-		!(inferredWeeklyPercent && weeklyConfig.isUnifiedBillingUser === true)
+		weeklyConfig
 	) {
 		const scope = { windowId: weeklyWindow.id, shared: true, ...(accountId ? { accountId } : {}) };
 		const overall = percentAmount(weeklyPercent);
@@ -625,21 +782,40 @@ function cursorLimit(
 }
 
 async function fetchCursorUsage(context: PiAuthUsageContext, fetchImpl: PiUsageFetch): Promise<SimpleUsageReport | undefined> {
-	const auth = await resolvePiAuth(context, "cursor", { origins: ["https://api2.cursor.sh"] });
-	if (!auth) return undefined;
-	const response = await fetchJson(
-		fetchImpl,
-		CURSOR_USAGE_URL,
-		{ ...bearerHeaders(auth), "Content-Type": "application/json", "Connect-Protocol-Version": "1" },
-		context.signal,
-		{ method: "POST", body: "{}" },
-	);
-	if ("error" in response) return failedReport("cursor", response.error);
-	const payload = response.value;
-	if (!isRecord(payload)) return failedReport("cursor", "invalid usage payload");
-	const window = cursorWindow(payload);
-	const plan = isRecord(payload.planUsage) ? payload.planUsage : undefined;
-	const individual = isRecord(payload.individualUsage) ? payload.individualUsage : undefined;
+	const registry = await resolvePiAuth(context, "cursor", { origins: ["https://api2.cursor.sh"] });
+	const stored = storedOAuthAuth(context, "cursor");
+	const candidates = uniqueAuths([
+		...[registry, stored].filter((auth): auth is PiAuth => Boolean(auth && isCursorJwt(auth.accessToken))),
+		...[registry, stored].filter((auth): auth is PiAuth => Boolean(auth && !isCursorJwt(auth.accessToken))),
+	]);
+	if (candidates.length === 0) return undefined;
+
+	let lastError: string | undefined;
+	for (const auth of candidates) {
+		const response = await fetchJson(
+			fetchImpl,
+			CURSOR_USAGE_URL,
+			{ ...bearerHeaders(auth), "Content-Type": "application/json", "Connect-Protocol-Version": "1" },
+			context.signal,
+			{ method: "POST", body: "{}" },
+		);
+		if ("error" in response) {
+			lastError = response.error;
+			if (response.status === 401 || response.status === 403) continue;
+			return failedReport("cursor", response.error);
+		}
+		const report = parseCursorUsagePayload(response.value);
+		if (report) return report;
+		lastError = "no recognized usage limits";
+	}
+	return failedReport("cursor", lastError ?? "no recognized usage limits");
+}
+
+function parseCursorUsagePayload(value: unknown): SimpleUsageReport | undefined {
+	if (!isRecord(value)) return undefined;
+	const window = cursorWindow(value);
+	const plan = isRecord(value.planUsage) ? value.planUsage : undefined;
+	const individual = isRecord(value.individualUsage) ? value.individualUsage : undefined;
 	const limits: SimpleUsageLimit[] = [];
 	const add = (limit: SimpleUsageLimit | undefined): void => {
 		if (limit) limits.push(limit);
@@ -663,14 +839,14 @@ async function fetchCursorUsage(context: PiAuthUsageContext, fetchImpl: PiUsageF
 	}
 	const onDemand = individual && isRecord(individual.onDemand) ? individual.onDemand : undefined;
 	add(cursorLimit("cursor:on-demand", "Cursor on-demand", onDemand, undefined));
-	if (limits.length === 0) return failedReport("cursor", "no recognized usage limits");
+	if (limits.length === 0) return undefined;
 	return {
 		provider: "cursor",
 		fetchedAt: Date.now(),
 		limits,
 		metadata: {
 			authSource: "pi",
-			...(text(payload.membershipType) ? { membershipType: text(payload.membershipType) } : {}),
+			...(text(value.membershipType) ? { membershipType: text(value.membershipType) } : {}),
 		},
 	};
 }
@@ -778,7 +954,10 @@ async function fetchKimiUsage(context: PiAuthUsageContext, fetchImpl: PiUsageFet
 	const auth = await resolvePiAuth(context, "kimi-coding", { origins: ["https://api.kimi.com"] });
 	if (!auth) return undefined;
 	const response = await fetchJson(fetchImpl, KIMI_USAGE_URL, bearerHeaders(auth), context.signal);
-	if ("error" in response) return failedReport("kimi-coding", response.error);
+	if ("error" in response) {
+		if (response.status === 429 || response.status === 402) return undefined;
+		return failedReport("kimi-coding", response.error);
+	}
 	const payload = response.value;
 	if (!isRecord(payload)) return failedReport("kimi-coding", "invalid usage payload");
 	const limits: SimpleUsageLimit[] = [];
@@ -814,25 +993,41 @@ async function fetchKimiUsage(context: PiAuthUsageContext, fetchImpl: PiUsageFet
 async function fetchOpenRouterUsage(context: PiAuthUsageContext, fetchImpl: PiUsageFetch): Promise<SimpleUsageReport | undefined> {
 	const auth = await resolvePiAuth(context, "openrouter", { origins: ["https://openrouter.ai"] });
 	if (!auth) return undefined;
-	const response = await fetchJson(fetchImpl, OPENROUTER_KEY_URL, bearerHeaders(auth), context.signal);
-	if ("error" in response) return failedReport("openrouter", response.error);
-	const payload = response.value;
-	const data = isRecord(payload) && isRecord(payload.data) ? payload.data : undefined;
-	if (!data) return failedReport("openrouter", "invalid usage payload");
+	const headers = bearerHeaders(auth);
+	const [keyResponse, creditsResponse] = await Promise.all([
+		fetchJson(fetchImpl, OPENROUTER_KEY_URL, headers, context.signal),
+		fetchJson(fetchImpl, OPENROUTER_CREDITS_URL, headers, context.signal),
+	]);
+	const data = "value" in keyResponse && isRecord(keyResponse.value) && isRecord(keyResponse.value.data) ? keyResponse.value.data : undefined;
+	const creditsData = "value" in creditsResponse && isRecord(creditsResponse.value) && isRecord(creditsResponse.value.data) ? creditsResponse.value.data : undefined;
 	const limits: SimpleUsageLimit[] = [];
-	const cap = number(data.limit);
-	if (cap !== undefined && cap > 0) {
-		const remaining = number(data.limit_remaining);
-		const used = remaining === undefined ? number(data.usage) : Math.max(0, cap - remaining);
-		const amount = used === undefined ? { limit: cap, unit: "usd" } : boundedAmount(used, cap, "usd");
-		if (amount) limits.push({ id: "openrouter:key-limit", label: "OpenRouter key limit", amount, window: { id: "key", label: "Key limit", ...(timestamp(data.limit_reset) !== undefined ? { resetsAt: timestamp(data.limit_reset) } : {}) }, status: usageStatus(amount.usedFraction ?? 0) });
+	const totalCredits = creditsData ? number(creditsData.total_credits) : undefined;
+	const totalUsage = creditsData ? number(creditsData.total_usage) : undefined;
+	if (totalCredits !== undefined && totalUsage !== undefined) {
+		const remaining = totalCredits - totalUsage;
+		limits.push({
+			id: "openrouter:credits",
+			label: "OpenRouter credits",
+			amount: { remaining: Math.max(0, remaining), unit: "usd" },
+			status: remaining > 0 ? "ok" : "exhausted",
+		});
 	}
-	for (const [field, label] of [["usage_daily", "OpenRouter today"], ["usage_weekly", "OpenRouter this week"], ["usage_monthly", "OpenRouter this month"], ["usage", "OpenRouter all-time"]] as const) {
-		const value = number(data[field]);
-		if (value !== undefined) limits.push({ id: `openrouter:usage:${field}`, label, amount: { used: value, unit: "usd" }, status: "ok" });
+	if (data) {
+		const cap = number(data.limit);
+		if (cap !== undefined && cap > 0) {
+			const remaining = number(data.limit_remaining);
+			const used = remaining === undefined ? number(data.usage) : Math.max(0, cap - remaining);
+			const amount = used === undefined ? { limit: cap, unit: "usd" } : boundedAmount(used, cap, "usd");
+			if (amount) limits.push({ id: "openrouter:key-limit", label: "OpenRouter key limit", amount, window: { id: "key", label: "Key limit", ...(timestamp(data.limit_reset) !== undefined ? { resetsAt: timestamp(data.limit_reset) } : {}) }, status: usageStatus(amount.usedFraction ?? 0) });
+		}
+		for (const [field, label] of [["usage_daily", "OpenRouter today"], ["usage_weekly", "OpenRouter this week"], ["usage_monthly", "OpenRouter this month"], ["usage", "OpenRouter all-time"]] as const) {
+			const value = number(data[field]);
+			if (value !== undefined) limits.push({ id: `openrouter:usage:${field}`, label, amount: { used: value, unit: "usd" }, status: "ok" });
+		}
 	}
-	if (limits.length === 0) return failedReport("openrouter", "no recognized usage limits");
-	return { provider: "openrouter", fetchedAt: Date.now(), limits, metadata: { authSource: "pi", ...(text(data.label) ? { keyLabel: text(data.label) } : {}) } };
+	if (limits.length === 0) return failedReport("openrouter", ("error" in keyResponse ? keyResponse.error : undefined) ?? ("error" in creditsResponse ? creditsResponse.error : undefined) ?? "no recognized usage limits");
+	const keyLabel = text(data?.label);
+	return { provider: "openrouter", fetchedAt: Date.now(), limits, metadata: { authSource: "pi", ...(keyLabel ? { keyLabel } : {}) } };
 }
 
 async function fetchDeepSeekUsage(context: PiAuthUsageContext, fetchImpl: PiUsageFetch): Promise<SimpleUsageReport | undefined> {
@@ -883,17 +1078,15 @@ export async function collectPiAuthUsageReports(
 	provider?: string,
 ): Promise<SimpleUsageReport[]> {
 	const requested = normalizeUsageProvider(provider);
-	const bridgeRequested = provider?.trim().toLowerCase() === "claude-bridge";
-	const effectiveContext = bridgeRequested ? { ...context, allowClaudeCodeFallback: true } : context;
 	const collectors: Array<[string, () => Promise<SimpleUsageReport | undefined>]> = [
-		["anthropic", () => fetchClaudeUsage(effectiveContext, fetchImpl)],
-		["cursor", () => fetchCursorUsage(effectiveContext, fetchImpl)],
-		["deepseek", () => fetchDeepSeekUsage(effectiveContext, fetchImpl)],
-		["kimi-coding", () => fetchKimiUsage(effectiveContext, fetchImpl)],
-		["openai-codex", () => fetchCodexUsage(effectiveContext, fetchImpl)],
-		["openrouter", () => fetchOpenRouterUsage(effectiveContext, fetchImpl)],
-		["opencode-go", () => fetchOpenCodeUsage(effectiveContext, fetchImpl)],
-		["xai-oauth", () => fetchXaiUsage(effectiveContext, fetchImpl)],
+		["anthropic", () => fetchClaudeUsage(context, fetchImpl)],
+		["cursor", () => fetchCursorUsage(context, fetchImpl)],
+		["deepseek", () => fetchDeepSeekUsage(context, fetchImpl)],
+		["kimi-coding", () => fetchKimiUsage(context, fetchImpl)],
+		["openai-codex", () => fetchCodexUsage(context, fetchImpl)],
+		["openrouter", () => fetchOpenRouterUsage(context, fetchImpl)],
+		["opencode-go", () => fetchOpenCodeUsage(context, fetchImpl)],
+		["xai-oauth", () => fetchXaiUsage(context, fetchImpl)],
 	];
 	const selected = requested ? collectors.filter(([id]) => id === requested) : collectors;
 	const reports = await Promise.all(

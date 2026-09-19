@@ -6,8 +6,8 @@ Provide a small Pi extension that renders verified Pi-auth provider quota data i
 
 ## INTENTION MATCHED
 
-- Resolve direct provider usage through Pi's signed-in `ctx.modelRegistry` or official stored credentials; support the Claude bridge through Claude Code's own OAuth credential when Claude models are hidden from Pi's model scope.
-- Query no OMP process or external usage CLI; read only the bridge's existing Claude Code OAuth credential when that provider is requested.
+- Resolve direct provider usage through Pi's signed-in `ctx.modelRegistry` or official stored credentials. Claude subscription quotas use the Claude Code CLI login (`$CLAUDE_CONFIG_DIR/.credentials.json` or `~/.claude/.credentials.json`); Pi `/login anthropic` is only used if that login is missing or rejected.
+- Query no OMP process or external usage CLI.
 - Support only providers whose direct usage endpoint and Pi-auth call are verified: Claude, Cursor, DeepSeek, Kimi Coding, OpenAI Codex, OpenRouter, OpenCode Go, and Grok.
 - Keep bare `/usage` focused on main programming quotas; reserve provider detail rows for `current` and `expanded`.
 - Show reset countdowns and estimate quota-exhaustion time from elapsed window time and observed quota burn.
@@ -18,7 +18,7 @@ Provide a small Pi extension that renders verified Pi-auth provider quota data i
 ## INTENTION NOT MATCHED
 
 - GitHub Copilot, Z.ai, and other providers without a verified usage call are intentionally not queried.
-- Claude Code bridge authentication is a narrow compatibility path, not a general external credential collector.
+- Pi console Anthropic OAuth is a fallback when the Claude Code login is missing or rejected, not the primary Claude usage credential.
 - The estimate is a pure burn-rate projection from one current snapshot, not a provider billing guarantee; quota resets are shown separately.
 - `/usage chat` targets markdown chat clients; it does not detect the host or change the default output.
 - Making a slash command display in an ACP host is out of scope: an extension can only emit `custom` or `user` role messages, so a host that drops custom messages must be fixed in the host.
