@@ -1,6 +1,8 @@
 # Pi Usage
 
-A Pi extension by dev-willbird1936 that renders provider usage limits as clean, theme-aware views.
+By [dev-willbird1936](https://github.com/dev-willbird1936).
+
+A Pi extension that renders provider usage limits as clean, theme-aware views.
 
 Live usage resolves direct-provider credentials through `ctx.modelRegistry` and Pi's official stored-credential API. Claude subscription quotas use the Claude Code CLI login; Pi `/login anthropic` is a different OAuth client and is only used if that login is missing or rejected. The extension has no external usage collector or OMP dependency; it reports only verified provider usage.
 

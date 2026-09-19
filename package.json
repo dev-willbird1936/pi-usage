@@ -2,7 +2,10 @@
   "name": "pi-usage-limits",
   "version": "0.5.3",
   "description": "Pi extension that renders verified Pi-auth provider usage limits as compact, expanded, or chat-text views.",
-  "author": "dev-willbird1936",
+  "author": {
+    "name": "dev-willbird1936",
+    "url": "https://github.com/dev-willbird1936"
+  },
   "license": "MIT",
   "keywords": ["pi-package", "pi-extension", "usage", "quota", "rate-limits"],
   "type": "module",
